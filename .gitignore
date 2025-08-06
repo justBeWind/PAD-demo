@@ -1,0 +1,115 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Pytest cache
+.pytest_cache/
+
+# VS Code settings
+.vscode/
+
+# Mac OS files
+.DS_Store
+
+# Chroma DB and generated data
+RetrievalBase/
+
+# Cache or logs
+*.log
+*.cache
+.cache/
+
+# Environment config
+.env
+.env.local
+.env.*.local
+
+# Data directories
+corpus/
+processed/
+Information/
+result/
+outputs/
+
+# Model files and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+models/
+checkpoints/
+runs/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Large data files
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Generated evaluation results
+evaluation_results/
+results/
+*.results
+
+# Hugging Face cache
+.cache/huggingface/
+transformers_cache/
+
+# TensorBoard logs
+runs/
+tensorboard_logs/
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Python distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch Lightning
+lightning_logs/
+
+# Weights & Biases
+wandb/
+
+# MLflow
+mlruns/
+mlflow.db
