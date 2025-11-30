@@ -347,9 +347,11 @@ def main():
             # Generate response using RAG pipeline
             result = rag.run(
                 prompt,
+                top_p=args.top_p,
                 max_new_tokens=args.max_tokens,
                 temperature=args.temperature,
                 do_sample=True,
+                # repetition_penalty=1.1
             )
             
             # Track privacy loss if noise injection is enabled
