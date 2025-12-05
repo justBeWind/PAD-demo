@@ -110,6 +110,13 @@ def main():
         action="store_true",
         help="Disable data-dependent noise calibration."
     )
+
+    # [新增] SE-PAD 开关
+    parser.add_argument(
+        "--disable_semantics",
+        action="store_true",
+        help="Disable Semantic-Aware (SE-PAD) features. If set, runs original PAD."
+    )
     
     # Noise type configuration
     parser.add_argument(
@@ -317,6 +324,10 @@ def main():
         delta=args.delta,
         enable_screening=not args.disable_screening,
         enable_calibration=not args.disable_calibration,
+        # [新增] 传递语义开关
+        # 如果命令行带了 --disable_semantics，则 enable_semantics=False (即原版 PAD)
+        # 否则默认 enable_semantics=True (即 SE-PAD)
+        enable_semantics=not args.disable_semantics,
         noise_amplification=args.noise_amplification,
         min_sensitivity=args.min_sensitivity,
         noise_type=args.noise_type,
@@ -351,7 +362,8 @@ def main():
                 max_new_tokens=args.max_tokens,
                 temperature=args.temperature,
                 do_sample=True,
-                # repetition_penalty=1.1
+                # repetition_penalty=1.1 #1.1的效果很好
+                repetition_penalty=1.0
             )
             
             # Track privacy loss if noise injection is enabled

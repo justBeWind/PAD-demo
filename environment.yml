@@ -261,4 +261,6 @@ dependencies:
       - zipp==3.21.0
       - zlib-state==0.1.9
       - zstandard==0.23.0
+      - spacy>=3.0.0
+      - spacy-transformers
 prefix: /home/haoran/anaconda3/envs/pad
