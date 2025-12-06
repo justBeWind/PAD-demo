@@ -111,12 +111,9 @@ def main():
         help="Disable data-dependent noise calibration."
     )
 
-    # [新增] SE-PAD 开关
-    parser.add_argument(
-        "--disable_semantics",
-        action="store_true",
-        help="Disable Semantic-Aware (SE-PAD) features. If set, runs original PAD."
-    )
+    # [新增] density_map 开关
+# 在 parser 参数定义区添加
+    parser.add_argument("--density_map", type=str, default=None, help="Path to pre-calculated token density JSON for DenPAD")
     
     # Noise type configuration
     parser.add_argument(
@@ -315,6 +312,7 @@ def main():
     tokenizer, model = setup_tokenizer_model(model_name, args.device)
 
     # Initialize LLM with privacy mechanisms
+    # 在初始化 LLMEngine 处
     llm = LLMEngine(
         model=model,
         tokenizer=tokenizer,
@@ -324,10 +322,10 @@ def main():
         delta=args.delta,
         enable_screening=not args.disable_screening,
         enable_calibration=not args.disable_calibration,
-        # [新增] 传递语义开关
-        # 如果命令行带了 --disable_semantics，则 enable_semantics=False (即原版 PAD)
-        # 否则默认 enable_semantics=True (即 SE-PAD)
-        enable_semantics=not args.disable_semantics,
+        
+        # [新增] DenPAD 参数
+        density_map_path=args.density_map,
+        
         noise_amplification=args.noise_amplification,
         min_sensitivity=args.min_sensitivity,
         noise_type=args.noise_type,
