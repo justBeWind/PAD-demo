@@ -361,7 +361,7 @@ def main():
                 temperature=args.temperature,
                 do_sample=True,
                 # repetition_penalty=1.1 #1.1的效果很好
-                repetition_penalty=1.0
+                # repetition_penalty=1.0
             )
             
             # Track privacy loss if noise injection is enabled

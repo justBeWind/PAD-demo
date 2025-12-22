@@ -296,17 +296,50 @@ class LLMEngine:
         if not self.model or not self.tokenizer:
             raise ValueError("Both model and tokenizer must be provided.")
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        # 1. Tokenize the input prompt
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"]
+        
+        # === [FIX] OOM / Context Truncation Logic ===
+        # Pythia-6.9B max window is 2048. We must ensure input + output fits.
+        # We reserve space for max_new_tokens.
+        max_new_tokens = decoding_kwargs.get("max_new_tokens", 256)
+        # Use model's config limit or default to 2048 if not found
+        model_max_length = getattr(self.model.config, "max_position_embeddings", 2048)
+        
+        # Calculate safe input length (minus a small buffer of 32 for safety)
+        safe_max_input_len = model_max_length - max_new_tokens - 32
+        
+        current_len = input_ids.shape[1]
+        if current_len > safe_max_input_len:
+            # logging.warning(f"Input length {current_len} exceeds safe limit {safe_max_input_len}. Truncating.")
+            # Truncate from the left (keep the end, which usually contains the Question)
+            # RAG Prompt: "Context: ... Question: ..." -> We want to keep Question.
+            input_ids = input_ids[:, -safe_max_input_len:]
+            
+            # Update inputs dict for generation
+            inputs["input_ids"] = input_ids
+            if "attention_mask" in inputs:
+                inputs["attention_mask"] = inputs["attention_mask"][:, -safe_max_input_len:]
+        
+        # Move to device
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
         if "pad_token_id" not in decoding_kwargs:
             decoding_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
             
+        # Attach Logits Processor
         if self.add_noise and self.noise_processor:
             if "logits_processor" not in decoding_kwargs:
                 decoding_kwargs["logits_processor"] = [self.noise_processor]
             else:
                 decoding_kwargs["logits_processor"].append(self.noise_processor)
-                
+        
+        # Generate
+        # Note: We pass **inputs directly which contains the truncated input_ids
         output_ids = self.model.generate(**inputs, **decoding_kwargs)
+        
+        # Decode only the generated part
         generated_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
         response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
