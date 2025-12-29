@@ -8,6 +8,14 @@ import json
 import logging
 import os
 
+# [新增] 尝试导入 LPRAG，如果环境没装也不影响主程序运行
+try:
+    from lprag_core import PrivacyPerturbator
+    LPRAG_AVAILABLE = True
+except ImportError:
+    LPRAG_AVAILABLE = False
+    print("Warning: LPRAG dependencies not found. LPRAG baseline will not work.")
+
 # === [New] DenPAD Core: Density Analyzer ===
 class DensityAnalyzer:
     """
@@ -264,6 +272,8 @@ class LLMEngine:
                  alpha=10.0, delta=1e-5, enable_screening=True, 
                  enable_calibration=True,
                  density_map_path=None, # <--- DenPAD Argument
+                 enable_lprag=False, # LPRAG 开关
+                 lprag_epsilon=3.0,  # LPRAG 的 epsilon
                  noise_amplification=2.0, min_sensitivity=0.5,
                  noise_type="adaptive", static_noise_scale=0.1, verbose=False):
         
@@ -273,6 +283,17 @@ class LLMEngine:
         self.epsilon = epsilon
         self.noise_type = noise_type
         self.verbose = verbose
+
+        # [新增 LPRAG 初始化]
+        self.enable_lprag = enable_lprag
+        self.lprag_perturbator = None
+        
+        if self.enable_lprag:
+            if not LPRAG_AVAILABLE:
+                raise ValueError("Cannot enable LPRAG: dependencies missing.")
+            print("Initializing LPRAG PrivacyPerturbator (this may take time to load Word2Vec/BERT)...")
+            # 初始化 LPRAG 核心类，这个类会自动加载 BERT 和 Word2Vec
+            self.lprag_perturbator = PrivacyPerturbator(total_epsilon=lprag_epsilon)
         
         if add_noise:
             if noise_type == "static":
@@ -295,9 +316,31 @@ class LLMEngine:
     def generate(self, prompt: str, **decoding_kwargs) -> str:
         if not self.model or not self.tokenizer:
             raise ValueError("Both model and tokenizer must be provided.")
+        final_prompt = prompt
 
-        # 1. Tokenize the input prompt
-        inputs = self.tokenizer(prompt, return_tensors="pt")
+        if self.enable_lprag and self.lprag_perturbator:
+            # 调用 LPRAG 的 perturb 方法
+            # 注意：LPRAG 的 perturb 比较慢，因为它要跑 NER 和 BERT
+            try:
+                # === [新增] 强制截断以适应 BERT 512 限制 ===
+                # BERT tokenizer 大约 1 token ≈ 4 characters
+                # 安全起见，截断到 1500-2000 字符
+                truncated_prompt = prompt[:2000]
+                # 简单处理：对整个 Prompt 进行扰动
+                # 或者，如果你能分离出 context，只扰动 context 更好。
+                # 鉴于 generate.py 里已经把 context 拼进去了，这里直接处理整个 prompt 也可以，
+                # 因为 LPRAG 主要是保护实体，Question 里的实体如果被换了，正好说明它可用性差。
+                final_prompt = self.lprag_perturbator.perturb(truncated_prompt)
+                
+                # [可选] 打印对比，看看 LPRAG 到底改了啥
+                # if self.verbose:
+                #     print(f"[LPRAG] Original: {prompt[:100]}...")
+                #     print(f"[LPRAG] Perturbed: {final_prompt[:100]}...")
+            except Exception as e:
+                print(f"Error during LPRAG perturbation: {e}")
+
+        # 1. Tokenize the input final_prompt(使用可能被修改过的 final_prompt)
+        inputs = self.tokenizer(final_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]
         
         # === [FIX] OOM / Context Truncation Logic ===

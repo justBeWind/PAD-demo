@@ -130,7 +130,9 @@ def main():
         help="Noise scale for static baseline (uniform noise injection)"
     )
     
-
+    # LPRAG Baseline Arguments
+    parser.add_argument("--enable_lprag", action="store_true", help="Enable LPRAG input perturbation baseline.")
+    parser.add_argument("--lprag_epsilon", type=float, default=3.0, help="Privacy budget for LPRAG.")
     
     # Corpus preprocessing options
     parser.add_argument(
@@ -325,6 +327,9 @@ def main():
         
         # [新增] DenPAD 参数
         density_map_path=args.density_map,
+        # 新增 LPRAG 参数
+        enable_lprag=args.enable_lprag,
+        lprag_epsilon=args.lprag_epsilon,
         
         noise_amplification=args.noise_amplification,
         min_sensitivity=args.min_sensitivity,
