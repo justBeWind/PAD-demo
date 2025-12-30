@@ -1,4 +1,5 @@
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BertTokenizer # 加上 BertTokenizer
 from sentence_transformers import CrossEncoder
 import numpy as np
 from transformers import LogitsProcessor
@@ -322,22 +323,33 @@ class LLMEngine:
             # 调用 LPRAG 的 perturb 方法
             # 注意：LPRAG 的 perturb 比较慢，因为它要跑 NER 和 BERT
             try:
-                # === [新增] 强制截断以适应 BERT 512 限制 ===
-                # BERT tokenizer 大约 1 token ≈ 4 characters
-                # 安全起见，截断到 1500-2000 字符
-                truncated_prompt = prompt[:2000]
-                # 简单处理：对整个 Prompt 进行扰动
-                # 或者，如果你能分离出 context，只扰动 context 更好。
-                # 鉴于 generate.py 里已经把 context 拼进去了，这里直接处理整个 prompt 也可以，
-                # 因为 LPRAG 主要是保护实体，Question 里的实体如果被换了，正好说明它可用性差。
-                final_prompt = self.lprag_perturbator.perturb(truncated_prompt)
+                # === [核弹级修复] 基于 BERT Token 的严格截断 ===
+                # 1. 临时初始化一个 BERT Tokenizer (和 LPRAG 内部用的一样)
+                #    (为了效率，你也可以在 __init__ 里初始化 self.bert_tokenizer)
+                bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
                 
+                # 2. 编码为 ID，不加特殊 token 以便计算长度
+                tokenized_ids = bert_tokenizer.encode(prompt, add_special_tokens=False)
+                
+                # 3. 严格截断到 510 (预留 [CLS] [SEP] 的位置，LPRAG 内部会加)
+                if len(tokenized_ids) > 510:
+                    tokenized_ids = tokenized_ids[:510]
+                    # 4. 解码回字符串
+                    truncated_prompt = bert_tokenizer.decode(tokenized_ids, skip_special_tokens=True)
+                else:
+                    truncated_prompt = prompt
+
+                # 5. 送入 LPRAG (现在绝对安全了)
+                final_prompt = self.lprag_perturbator.perturb(truncated_prompt)
                 # [可选] 打印对比，看看 LPRAG 到底改了啥
                 # if self.verbose:
                 #     print(f"[LPRAG] Original: {prompt[:100]}...")
                 #     print(f"[LPRAG] Perturbed: {final_prompt[:100]}...")
             except Exception as e:
+                # 如果这样还报错，那就是天意了，打印出来看看
                 print(f"Error during LPRAG perturbation: {e}")
+                # 回退到原始 prompt (Baseline)
+                final_prompt = prompt
 
         # 1. Tokenize the input final_prompt(使用可能被修改过的 final_prompt)
         inputs = self.tokenizer(final_prompt, return_tensors="pt")
