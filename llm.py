@@ -168,6 +168,8 @@ class AdaptiveNoiseProcessor(LogitsProcessor):
     def __init__(self, epsilon_base=1.0, alpha=10.0, delta=1e-5, 
                  enable_screening=True, enable_calibration=True,
                  density_map_path=None,  # <--- DenPAD param
+                 # [新增参数] 默认为 full (即 DenPAD 完整版)
+                 ablation_mode="full",
                  noise_amplification=2.0, min_sensitivity=0.5):
         
         self.base_scale = 0.01 / max(epsilon_base, 0.01)
@@ -182,7 +184,9 @@ class AdaptiveNoiseProcessor(LogitsProcessor):
         
         self.calibrator = DataDependentCalibrator() if enable_calibration else None
         self.screener = ScreeningMechanism() if enable_screening else None
-        
+        # [新增] 保存消融模式
+        self.ablation_mode = ablation_mode
+
         # DenPAD Initialization
         self.density_analyzer = None
         if density_map_path:
@@ -228,14 +232,42 @@ class AdaptiveNoiseProcessor(LogitsProcessor):
             margin = logit_margin.mean().item()
             
             # Base sensitivity from PAD (Heuristic based on margin)
-            base_sensitivity = max(
+            conf_sensitivity = max(
                 self.min_sensitivity,
                 min(1.0 / (1 + np.log(1 + max(margin, 1e-6))), 1.0)
             )
+            # === 2. 计算语义密度敏感度 (Density Sensitivity) ===
+        density_sensitivity = 0.0
+        if self.density_analyzer:
+            # 获取当前预测概率最高的 token
+            probs = F.softmax(scores, dim=-1)
+            top_token_id = torch.argmax(probs, dim=-1).item()
+            # 获取其敏感度 (1 - density)
+            density_sensitivity = self.density_analyzer.get_token_sensitivity(top_token_id)
+
+        # === [核心修改] 3. 根据消融模式融合敏感度 ===
+        if self.ablation_mode == "confidence_only":
+            # 变体 A: 仅使用置信度 (相当于回退到 PAD)
+            final_sensitivity = conf_sensitivity
             
+        elif self.ablation_mode == "density_only":
+            # 变体 B: 仅使用语义密度 (w/o Confidence)
+            final_sensitivity = density_sensitivity
+            # 保护机制：给一个最小敏感度，防止完全不加噪
+            final_sensitivity = max(final_sensitivity, self.min_sensitivity)
+            
+        elif self.ablation_mode == "average":
+            # 变体 C: 平均策略 (Average Strategy)
+            final_sensitivity = (conf_sensitivity + density_sensitivity) / 2.0
+            
+        else: # "full" (DenPAD Default: Max Strategy)
+            # 我们的完整方法：取最大值
+            final_sensitivity = max(conf_sensitivity, density_sensitivity)
+
+        # === 4. 使用最终敏感度 ===
+        sensitivity = final_sensitivity
             # DenPAD Core: Final sensitivity is MAX of (PAD-Est, Density-Sens)
             # If word is rare (high semantic_sensitivity), sensitivity -> 1.0 (Worst Case Bound)
-            sensitivity = max(base_sensitivity, semantic_sensitivity)
         
         # --- Step 4: Calibration ---
         if self.calibrator:
@@ -275,6 +307,7 @@ class LLMEngine:
                  density_map_path=None, # <--- DenPAD Argument
                  enable_lprag=False, # LPRAG 开关
                  lprag_epsilon=3.0,  # LPRAG 的 epsilon
+                 ablation_mode="full", #消融实验开关，默认full的情况下是不消融的
                  noise_amplification=2.0, min_sensitivity=0.5,
                  noise_type="adaptive", static_noise_scale=0.1, verbose=False):
         
@@ -308,6 +341,7 @@ class LLMEngine:
                     enable_screening=enable_screening,
                     enable_calibration=enable_calibration,
                     density_map_path=density_map_path, # Passed to processor
+                    ablation_mode=ablation_mode,
                     noise_amplification=noise_amplification,
                     min_sensitivity=min_sensitivity
                 )

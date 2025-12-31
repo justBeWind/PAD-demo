@@ -130,6 +130,15 @@ def main():
         help="Noise scale for static baseline (uniform noise injection)"
     )
     
+    # 在 DenPAD parameters 附近添加,消融开关
+    parser.add_argument(
+        "--ablation_mode",
+        type=str,
+        choices=["full", "confidence_only", "density_only", "average"],
+        default="full",
+        help="Ablation mode for sensitivity calculation."
+    )
+
     # LPRAG Baseline Arguments
     parser.add_argument("--enable_lprag", action="store_true", help="Enable LPRAG input perturbation baseline.")
     parser.add_argument("--lprag_epsilon", type=float, default=3.0, help="Privacy budget for LPRAG.")
@@ -330,6 +339,8 @@ def main():
         # 新增 LPRAG 参数
         enable_lprag=args.enable_lprag,
         lprag_epsilon=args.lprag_epsilon,
+        # 新增消融开关
+        ablation_mode=args.ablation_mode,
         
         noise_amplification=args.noise_amplification,
         min_sensitivity=args.min_sensitivity,
