@@ -6,123 +6,131 @@ import numpy as np
 from transformers import AutoModelForCausalLM
 from tqdm import tqdm
 
-def calculate_density(model_name, output_path, k=20, device="cuda"):
+def calculate_density_smoothed(model_name, output_path, k=20, device="cuda"):
     """
-    Strict implementation of DYNTEXT density calculation logic.
-    1. Calculate Euclidean distance matrix.
-    2. Find K-th nearest neighbor distance for each token.
-    3. Calculate Gamma (average of K-th distances).
-    4. Calculate Density (count of neighbors within Gamma).
-    5. Min-Max Normalize.
+    DenPAD Implementation: Semantic Manifold Density (Local Smoothing).
+    
+    Difference from DYNTEXT:
+    - DYNTEXT uses the distance to the K-th neighbor (Single Point).
+    - DenPAD uses the AVERAGE distance of the top-K neighbors (Manifold Smoothing).
+    
+    This provides a more robust estimation of the local semantic sparsity.
     """
     print(f"Loading model: {model_name}...")
-    # Load model in FP16 to save memory (Pythia-6.9B takes ~14GB VRAM)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.float16, 
-        device_map=device
-    )
-    
-    # Extract Embedding Matrix [Vocab_Size, Hidden_Dim]
-    # For Pythia (GPT-NeoX), the layer is gpt_neox.embed_in
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=torch.float16, 
+            device_map=device
+        )
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return
+
     if hasattr(model, "gpt_neox"):
         embed_weight = model.gpt_neox.embed_in.weight.detach()
-    elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"): # Llama/Mistral
+    elif hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_weight = model.model.embed_tokens.weight.detach()
     else:
-        # Fallback for other architectures (e.g. GPT2)
         embed_weight = model.get_input_embeddings().weight.detach()
 
     vocab_size = embed_weight.shape[0]
-    hidden_dim = embed_weight.shape[1]
-    print(f"Vocab size: {vocab_size}, Embedding dim: {hidden_dim}")
+    print(f"Vocab size: {vocab_size}, Dim: {embed_weight.shape[1]}")
 
-    # To avoid OOM, we calculate distances in chunks
-    # DYNTEXT Step 1 & 2: Get d(t, t_K)
-    dist_to_kth_neighbor = []
-    chunk_size = 500  # Conservative chunk size for 24GB VRAM
+    # To avoid OOM
+    chunk_size = 500
     
-    print(f"Phase 1: Calculating K-th ({k}) nearest neighbor distances...")
+    # === Step 1: Calculate Smoothed Distances ===
+    # 我们不再只存第 K 个距离，而是计算前 K 个的平均值
+    avg_knn_distances = []
     
-    # Ensure embeddings are on GPU and float32 for precision in distance calc
-    embed_weight = embed_weight.to(device)
+    print(f"Phase 1: Calculating Average K-NN Distances (Smoothing, K={k})...")
+    
+    embed_weight = embed_weight.to(device).float()
     
     for i in tqdm(range(0, vocab_size, chunk_size)):
         end = min(i + chunk_size, vocab_size)
         chunk_indices = slice(i, end)
-        chunk_vecs = embed_weight[chunk_indices].float() # [batch, dim]
+        chunk_vecs = embed_weight[chunk_indices]
         
-        # Compute pairwise Euclidean distances: |x-y|
-        # torch.cdist creates a [batch, vocab_size] matrix
-        dists = torch.cdist(chunk_vecs, embed_weight.float(), p=2)
+        # Euclidean Distance
+        dists = torch.cdist(chunk_vecs, embed_weight, p=2)
         
-        # Find k-th nearest neighbor
-        # Note: Top-1 is the token itself (distance 0), so we need (k+1)-th smallest
-        # topk returns largest, so we use largest=False (smallest)
-        topk_vals = torch.topk(dists, k=k+1, dim=1, largest=False).values # [batch, k+1]
+        # Find K nearest neighbors (excluding self, so k+1)
+        # topk returns largest values, so we use largest=False for smallest distances
+        topk_res = torch.topk(dists, k=k+1, dim=1, largest=False)
+        topk_vals = topk_res.values # [batch, k+1]
         
-        # The K-th neighbor is at index k (0-based, index 0 is self)
-        kth_dists = topk_vals[:, k]
-        dist_to_kth_neighbor.append(kth_dists.cpu())
+        # [核心修改] Innovation: Semantic Smoothing
+        # DYNTEXT: kth_dists = topk_vals[:, k]
+        # DenPAD:  avg_dists = mean(topk_vals[:, 1:])  (Index 0 is self, dist=0)
         
-        # Cleanup to free VRAM
+        # 取第 1 到 第 k 个邻居的距离 (排除 0)
+        neighbor_dists = topk_vals[:, 1:] # [batch, k]
+        avg_dists = neighbor_dists.mean(dim=1) # [batch]
+        
+        avg_knn_distances.append(avg_dists.cpu())
+        
         del dists, topk_vals, chunk_vecs
         torch.cuda.empty_cache()
 
-    dist_to_kth_neighbor = torch.cat(dist_to_kth_neighbor).numpy()
+    avg_knn_distances = torch.cat(avg_knn_distances).numpy()
     
-    # DYNTEXT Step 3: Calculate Gamma (Average Density Range)
-    gamma = np.mean(dist_to_kth_neighbor)
-    print(f"Calculated Threshold Gamma: {gamma:.6f}")
+    # === Step 2: Calculate Threshold (Gamma) ===
+    # Gamma 也是基于平均距离的平均值
+    gamma = np.mean(avg_knn_distances)
+    print(f"Calculated Manifold Threshold (Gamma): {gamma:.6f}")
     
-    # DYNTEXT Step 4: Calculate Density f(t)
-    # f(t) = count of tokens where distance <= Gamma
-    print("Phase 2: Calculating token densities...")
-    raw_densities = []
+    # === Step 3: Calculate Manifold Density ===
+    # f(t) = count of tokens where Smoothed_Distance <= Gamma
+    # 注意：为了保持计算一致性，这里我们不需要重新算 cdist
+    # 因为我们已经有了 avg_knn_distances，我们可以直接用它来衡量“稀疏度”。
+    # 但为了对齐 DYNTEXT 的“计数法”定义（密度=邻居多），我们还是得重新扫描一遍
+    # 只要一个词的 "平均邻域半径" 小于 Gamma，说明它周围很挤 -> 密度高
     
-    for i in tqdm(range(0, vocab_size, chunk_size)):
-        end = min(i + chunk_size, vocab_size)
-        chunk_indices = slice(i, end)
-        chunk_vecs = embed_weight[chunk_indices].float()
+    # 实际上，更科学的方法是直接用 avg_knn_distances 作为“稀疏度指标”
+    # Distance 越小 -> 越 Dense
+    # Distance 越大 -> 越 Sparse
+    # 所以 Density = -Distance (或者 1/Distance)
+    
+    # 为了让代码改动最小且符合 "Density Map" 格式 (0~1, 1=Dense)：
+    # 我们直接归一化反转 Distance。
+    
+    print("Phase 2: Converting Smoothed Distances to Density...")
+    
+    # Distance: Min (0.0, very dense) -> Max (large, very sparse)
+    d_min = avg_knn_distances.min()
+    d_max = avg_knn_distances.max()
+    print(f"Smoothed Distance Range: min={d_min:.4f}, max={d_max:.4f}")
+    
+    # Normalize Distance to [0, 1]
+    # norm_dist 0.0 = Dense (cluster center)
+    # norm_dist 1.0 = Sparse (outlier)
+    normalized_distances = (avg_knn_distances - d_min) / (d_max - d_min + 1e-8)
+    
+    # Density = 1 - Normalized_Distance
+    # Density 1.0 = Dense
+    # Density 0.0 = Sparse
+    final_densities = 1.0 - normalized_distances
+    
+    # Save
+    density_list = [round(float(x), 5) for x in final_densities]
+    
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
         
-        dists = torch.cdist(chunk_vecs, embed_weight.float(), p=2)
-        
-        # Count neighbors within gamma
-        count = (dists <= gamma).sum(dim=1).cpu().numpy()
-        raw_densities.append(count)
-        
-        del dists, chunk_vecs
-        torch.cuda.empty_cache()
-        
-    raw_densities = np.concatenate(raw_densities)
-    
-    # DYNTEXT Step 5: Min-Max Normalization
-    # F_hat(t) = (f(t) - min) / (max - min)
-    f_min = raw_densities.min()
-    f_max = raw_densities.max()
-    print(f"Density Raw Range: min={f_min}, max={f_max}")
-    
-    normalized_densities = (raw_densities - f_min) / (f_max - f_min + 1e-8)
-    
-    # Invert for Sensitivity: 
-    # High Density (1.0) -> Common Word -> Low Sensitivity (0.0)
-    # Low Density (0.0) -> Rare Word -> High Sensitivity (1.0)
-    # We save the DENSITY, logic will be handled in LLMEngine
-    
-    # Save as JSON list
-    density_list = [round(float(x), 5) for x in normalized_densities]
-    
     with open(output_path, "w") as f:
         json.dump(density_list, f)
         
-    print(f"Success! Density map saved to {output_path}")
+    print(f"Success! Smoothed Local Density map saved to {output_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-6.9b")
-    parser.add_argument("--output", type=str, default="data/pythia_6.9b_density.json")
-    parser.add_argument("--k", type=int, default=20, help="Parameter K for density calculation (Default: 20)")
+    # 为了区分，建议文件名加上 smoothed
+    parser.add_argument("--output", type=str, default="data/pythia_6.9b_density_smoothed.json")
+    parser.add_argument("--k", type=int, default=20)
     args = parser.parse_args()
     
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    calculate_density(args.model_name, args.output, k=args.k)
+    calculate_density_smoothed(args.model_name, args.output, k=args.k)
