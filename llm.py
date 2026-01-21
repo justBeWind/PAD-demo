@@ -37,8 +37,14 @@ class DensityAnalyzer:
         if not self.density_map or token_id < 0 or token_id >= len(self.density_map):
             return 0.0 
         density = self.density_map[token_id]
-        # 纯密度驱动核心公式: Sensitivity = 1 - Density
+        # 纯密度驱动敏感度: Sensitivity = 1 - Density
         return 1.0 - density
+        
+    def get_token_density(self, token_id):
+        # 获取原始密度值用于校准
+        if not self.density_map or token_id < 0 or token_id >= len(self.density_map):
+            return 1.0 # 默认为高密度（通用词）
+        return self.density_map[token_id]
 
 # === RDP Accountant ===
 class RDPAccountant:
@@ -85,31 +91,51 @@ class StaticNoiseProcessor(LogitsProcessor):
     def get_gamma(self):
         return self.accountant.get_gamma()
 
-# === PAD Calibrator (保留但仅用于非敏感词) ===
+# === [核心修改] Unified Manifold-Aware Calibrator ===
 class DataDependentCalibrator:
     def __init__(self, entropy_weight=0.3, position_weight=0.2):
         self.entropy_weight = entropy_weight
         self.position_weight = position_weight
+        # 新增: 语义稀疏先验的权重 (Semantic Sparsity Weight)
+        # 设为 2.0 意味着当 density=0 (极稀疏) 时，该项贡献 2.0 倍的基础噪声，
+        # 这在效果上等同于甚至强于之前的 Bypass (1.5倍)。
+        self.density_weight = 2.0 
     
-    def calibrate_noise_scale(self, scores, position, base_scale):
+    def calibrate_noise_scale(self, scores, position, base_scale, density=1.0):
         with torch.no_grad():
             probs = F.softmax(scores, dim=-1)
             log_probs = F.log_softmax(scores, dim=-1)
+            
+            # 1. Model Uncertainty (Entropy)
             token_entropy = -(probs * log_probs).sum().item()
             max_entropy = np.log(probs.numel())
             normalized_entropy = token_entropy / max_entropy
             
+            # 2. Positional Decay
             position_factor = 1.0 / (1.0 + position * 0.1)
+            
+            # 3. Confidence Factor (Optional, PAD uses it, we keep it for Low-Risk compatibility)
             top1_prob = probs.max().item()
             confidence_factor = 1.0 - top1_prob
             
+            # === [核心公式] Unified Calibration ===
+            # C(y, p, t) = w_sem * (1 - rho) + w_unc * H(p) + w_pos * f_pos
+            
+            # 语义稀疏先验 (Semantic Sparsity Prior)
+            # 密度越低(rho->0)，sparsity->1，噪声越大。
+            # 这是对抗 "过度自信" 的主力军。
+            sparsity_prior = self.density_weight * (1.0 - density)
+            
             calibration_factor = (
-                (1 - self.entropy_weight) * 1.0 +
-                self.entropy_weight * normalized_entropy +
-                self.position_weight * position_factor +
-                confidence_factor * 0.3
+                sparsity_prior +                         # 1. 语义几何项 (主导敏感实体)
+                self.entropy_weight * normalized_entropy + # 2. 模型不确定性项
+                self.position_weight * position_factor +   # 3. 位置项
+                confidence_factor * 0.3                    # 4. 辅助置信度项
             )
-            calibration_factor = max(0.1, min(2.0, calibration_factor))
+            
+            # 兜底逻辑：防止噪声过小导致数值问题
+            calibration_factor = max(0.1, min(4.0, calibration_factor))
+            
             return base_scale * calibration_factor
 
 # === PAD Screening ===
@@ -125,12 +151,12 @@ class ScreeningMechanism:
         logit_margin = (topk[..., 0] - topk[..., 1]).mean().item()
         return top1_prob > self.confidence_threshold and logit_margin > self.margin_threshold
 
-# === DenPAD Adaptive Processor (Pure Density Version) ===
+# === DenPAD Adaptive Processor (Final Unified Version) ===
 class AdaptiveNoiseProcessor(LogitsProcessor):
     def __init__(self, epsilon_base=1.0, alpha=10.0, delta=1e-5, 
                  enable_screening=True, enable_calibration=True,
                  density_map_path=None,  
-                 ablation_mode="full", # 这里我们保留参数接口，但逻辑上已经全面倒向 Density
+                 ablation_mode="full",
                  noise_amplification=2.0, min_sensitivity=0.5):
         
         self.base_scale = 0.01 / max(epsilon_base, 0.01)
@@ -156,60 +182,52 @@ class AdaptiveNoiseProcessor(LogitsProcessor):
     def __call__(self, input_ids, scores):
         self.step_count += 1
         
-        # 1. Look-ahead: 获取预测的 Token 及其密度敏感度
+        # 1. Look-ahead: 获取预测 Token 的几何属性
         top_token_id = torch.argmax(scores, dim=-1).item()
         density_sensitivity = 0.0
+        current_density = 1.0 # 默认为满密度
+        
         if self.density_analyzer:
             density_sensitivity = self.density_analyzer.get_token_sensitivity(top_token_id)
+            current_density = self.density_analyzer.get_token_density(top_token_id)
         
-        # 定义高风险：如果敏感度很高 (对应密度很低)
-        # 这里阈值设为 0.5，意味着如果一个词比 50% 的词都稀疏，就开始重点关照
-        is_high_risk = density_sensitivity > 0.5 
+        # 2. Screening (第一道防线：筛选)
+        # 注意：这里我们移除了 is_high_risk 的硬性阻断，
+        # 因为 Unified Calibration 可以在下一步产生足够大的噪声，
+        # 即使 Screening 跳过了，我们依然可以通过 RDP 记录来保证隐私（或者在此处保留软筛选）。
+        # 但为了稳妥，对于极高风险的词（Pure Density Sensitivity 很高），
+        # 我们依然建议在这里做一个隐式的保护：不跳过。
         
-        # 2. Screening (跳过机制)
         skip_noise = False
         if self.screener and self.screener.should_skip_noise(scores):
-            skip_noise = True
+            # 如果是极其敏感的词 (density < 0.5)，我们倾向于不信任 Screening
+            if density_sensitivity > 0.5:
+                skip_noise = False
+            else:
+                skip_noise = True
         
-        # [纯密度驱动核心逻辑 1] 
-        # 只要是 Density 判定为高风险，绝对不跳过加噪！哪怕模型 Confidence 是 99.9%
-        if is_high_risk:
-            skip_noise = False 
-            
         if skip_noise:
-            # 对于低风险且模型自信的词，加极小噪声或者不加
             minimal_noise = torch.randn_like(scores) * self.min_sigma
             self.accountant.add_gaussian_step(sensitivity=0.0, sigma=self.min_sigma, noise_injected=True)
             return scores + minimal_noise
         
-        # 3. 敏感度计算 (纯密度驱动)
-        # 我们不再关心 PAD 计算出的 conf_sensitivity (logit margin)
-        # 我们只信任 Density Map
-        
+        # 3. Sensitivity Calculation (Pure Density Driven)
         final_sensitivity = density_sensitivity
-        
-        # 兜底逻辑：为了避免完全不加噪导致隐私泄露，我们给一个最小敏感度
-        # 如果你想要极端的“纯密度”，可以将 min_sensitivity 设得很低。
-        # 但通常保留 0.4-0.5 的底线对 Utility 影响不大，对 Privacy 有好处。
         final_sensitivity = max(final_sensitivity, self.min_sensitivity)
         
-        # 4. 噪声校准 (Calibration) - 纯密度驱动的关键
-        
-        if is_high_risk:
-            # [纯密度驱动核心逻辑 2] - Bypass PAD Calibrator
-            # 如果是敏感实体，我们完全不相信 PAD 的 Calibrator (因为它会因为模型自信而降低噪声)
-            # 我们强制使用 Base Scale，甚至为了安全起见，稍微放大 (x1.2 或 x1.5)
-            # 这就是你“纯密度”逻辑起作用的地方：Data-Centric Override Model-Centric
-            sigma = self.base_scale * 1.5 
+        # 4. Noise Calibration (Unified Manifold-Aware)
+        # 直接调用统一校准器，无需 Bypass 逻辑
+        if self.calibrator:
+            sigma = self.calibrator.calibrate_noise_scale(
+                scores, 
+                self.step_count, 
+                self.base_scale, 
+                density=current_density # 传入密度，让公式自动处理
+            )
         else:
-            # 对于非敏感词 (通用词)，我们可以让 PAD 校准器接管，保证生成流畅性 (Utility)
-            if self.calibrator:
-                sigma = self.calibrator.calibrate_noise_scale(scores, self.step_count, self.base_scale)
-            else:
-                sigma = self.base_scale
+            sigma = self.base_scale
             
-        # 5. 最终注入
-        # sigma 已经通过 Bypass 逻辑得到了保障，这里再乘上 sensitivity 和 amplification
+        # 5. Injection
         sigma_final = sigma * (final_sensitivity / self.epsilon_base) * self.noise_amplification
         sigma_final = min(self.max_sigma, max(self.min_sigma, sigma_final))
         
