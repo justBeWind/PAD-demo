@@ -31,6 +31,11 @@ def setup_tokenizer_model(name: str, device: str = "auto"):
         tuple: (tokenizer, model)
     """
     tokenizer = AutoTokenizer.from_pretrained(name)
+    # === [新增] Llama 兼容性修复: 自动补全 pad_token ===
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # =================================================
     if device == "auto":
         model = AutoModelForCausalLM.from_pretrained(name, device_map="auto")
     else:
