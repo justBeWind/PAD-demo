@@ -8,8 +8,9 @@ import math
 import json
 import logging
 import os
+import bisect 
+from collections import defaultdict, Counter
 
-# 尝试导入 LPRAG
 try:
     from lprag_core import PrivacyPerturbator
     LPRAG_AVAILABLE = True
@@ -20,229 +21,190 @@ except ImportError:
 # === DenPAD Core: Density Analyzer ===
 class DensityAnalyzer:
     def __init__(self, density_file):
-        self.density_map = []
+        self.density_map = None 
+        self.is_list = False    
+        self.sorted_densities = [] 
+        
         if density_file and os.path.exists(density_file):
             logging.info(f"Loading density map from {density_file}...")
             try:
                 with open(density_file, 'r') as f:
                     self.density_map = json.load(f)
-                logging.info(f"Loaded density map for {len(self.density_map)} tokens.")
+                if isinstance(self.density_map, list):
+                    self.is_list = True
+                    self.sorted_densities = sorted([float(x) for x in self.density_map])
+                elif isinstance(self.density_map, dict):
+                    self.is_list = False
+                    self.sorted_densities = sorted([float(x) for x in self.density_map.values()])
             except Exception as e:
                 logging.error(f"Failed to load density map: {e}")
-        else:
-            if density_file:
-                logging.warning(f"Density file {density_file} not found! Defaulting to 0 sensitivity.")
+                self.density_map = None
 
-    def get_token_sensitivity(self, token_id):
-        if not self.density_map or token_id < 0 or token_id >= len(self.density_map):
-            return 0.0 
-        density = self.density_map[token_id]
-        # 纯密度驱动敏感度: Sensitivity = 1 - Density
-        return 1.0 - density
-        
-    def get_token_density(self, token_id):
-        # 获取原始密度值用于校准
-        if not self.density_map or token_id < 0 or token_id >= len(self.density_map):
-            return 1.0 # 默认为高密度（通用词）
-        return self.density_map[token_id]
+    def get_token_rank(self, token_id):
+        if self.density_map is None: return 1.0 
+        try:
+            raw_density = 0.0
+            if self.is_list:
+                if 0 <= token_id < len(self.density_map):
+                    raw_density = self.density_map[token_id]
+                else: return 1.0 
+            else:
+                token_key = str(token_id)
+                if token_key in self.density_map:
+                    raw_density = self.density_map[token_key]
+                else: return 1.0 
+            index = bisect.bisect_left(self.sorted_densities, raw_density)
+            return index / len(self.sorted_densities)
+        except Exception:
+            return 1.0
 
 # === RDP Accountant ===
 class RDPAccountant:
     def __init__(self, alpha=10.0, delta=1e-5):
         self.alpha = alpha
         self.delta = delta
-        self.rdp = 0.0
-        self.steps_with_noise = 0
-        self.total_steps = 0
+        self.history = []
+        self.alphas = [1.5, 1.75, 2, 2.5, 3, 4, 5, 6, 8, 16, 32, 64, 1e6]
 
     def add_gaussian_step(self, sensitivity, sigma, noise_injected=True):
-        self.total_steps += 1
-        if noise_injected:
-            self.steps_with_noise += 1
-            if sigma > 0:
-                self.rdp += (self.alpha * (sensitivity ** 2)) / (2 * (sigma ** 2))
-
-    def get_epsilon(self):
-        return self.rdp + np.log(1 / self.delta) / (self.alpha - 1)
+        if noise_injected and sigma > 0:
+            step_cost = {}
+            for alpha in self.alphas:
+                if alpha == 1e6: cost = float('inf')
+                else: cost = (alpha * (sensitivity ** 2)) / (2 * (sigma ** 2))
+                step_cost[alpha] = cost
+            self.history.append(step_cost)
+        
+    def get_total_privacy_loss(self, delta=1e-5):
+        if not self.history: return 0.0
+        min_epsilon = float('inf')
+        for alpha in self.alphas:
+            if alpha == 1e6: continue
+            total_rdp = sum(step.get(alpha, 0) for step in self.history)
+            epsilon_alpha = total_rdp + (math.log(1/delta) + math.log(alpha - 1)) / (alpha - 1)
+            if epsilon_alpha < min_epsilon: min_epsilon = epsilon_alpha
+        return min_epsilon
     
-    def get_gamma(self):
-        if self.total_steps == 0:
-            return 1.0
-        return self.steps_with_noise / self.total_steps
+    def get_gamma(self): return 1.0
 
 # === Static Noise Processor ===
 class StaticNoiseProcessor(LogitsProcessor):
     def __init__(self, epsilon_base=1.0, alpha=10.0, delta=1e-5, noise_scale=0.1):
         self.noise_scale = noise_scale
-        self.epsilon_base = epsilon_base
         self.accountant = RDPAccountant(alpha=alpha, delta=delta)
-        self.step_count = 0
         self.sensitivity = 1.0 
 
     def __call__(self, input_ids, scores):
-        self.step_count += 1
         noise = torch.randn_like(scores) * self.noise_scale
         self.accountant.add_gaussian_step(sensitivity=self.sensitivity, sigma=self.noise_scale, noise_injected=True)
         return scores + noise
+    def get_total_privacy_loss(self): return self.accountant.get_total_privacy_loss()
+    def get_gamma(self): return 1.0
 
-    def get_total_privacy_loss(self):
-        return self.accountant.get_epsilon()
-    
-    def get_gamma(self):
-        return self.accountant.get_gamma()
-
-# === [核心修改] Unified Manifold-Aware Calibrator ===
-class DataDependentCalibrator:
-    def __init__(self, entropy_weight=0.3, position_weight=0.2):
-        self.entropy_weight = entropy_weight
-        self.position_weight = position_weight
-        # 新增: 语义稀疏先验的权重 (Semantic Sparsity Weight)
-        # 设为 2.0 意味着当 density=0 (极稀疏) 时，该项贡献 2.0 倍的基础噪声，
-        # 这在效果上等同于甚至强于之前的 Bypass (1.5倍)。
-        self.density_weight = 2.0 
-    
-    def calibrate_noise_scale(self, scores, position, base_scale, density=1.0):
-        with torch.no_grad():
-            probs = F.softmax(scores, dim=-1)
-            log_probs = F.log_softmax(scores, dim=-1)
-            
-            # 1. Model Uncertainty (Entropy)
-            token_entropy = -(probs * log_probs).sum().item()
-            max_entropy = np.log(probs.numel())
-            normalized_entropy = token_entropy / max_entropy
-            
-            # 2. Positional Decay
-            position_factor = 1.0 / (1.0 + position * 0.1)
-            
-            # 3. Confidence Factor (Optional, PAD uses it, we keep it for Low-Risk compatibility)
-            top1_prob = probs.max().item()
-            confidence_factor = 1.0 - top1_prob
-            
-            # === [核心公式] Unified Calibration ===
-            # C(y, p, t) = w_sem * (1 - rho) + w_unc * H(p) + w_pos * f_pos
-            
-            # 语义稀疏先验 (Semantic Sparsity Prior)
-            # 密度越低(rho->0)，sparsity->1，噪声越大。
-            # 这是对抗 "过度自信" 的主力军。
-            sparsity_prior = self.density_weight * (1.0 - density)
-            
-            calibration_factor = (
-                sparsity_prior +                         # 1. 语义几何项 (主导敏感实体)
-                self.entropy_weight * normalized_entropy + # 2. 模型不确定性项
-                self.position_weight * position_factor +   # 3. 位置项
-                confidence_factor * 0.3                    # 4. 辅助置信度项
-            )
-            
-            # 兜底逻辑：防止噪声过小导致数值问题
-            calibration_factor = max(0.1, min(4.0, calibration_factor))
-            
-            return base_scale * calibration_factor
-
-# === PAD Screening ===
-class ScreeningMechanism:
-    def __init__(self, confidence_threshold=0.9, margin_threshold=2.0):
-        self.confidence_threshold = confidence_threshold
-        self.margin_threshold = margin_threshold
-    
-    def should_skip_noise(self, scores):
-        probs = F.softmax(scores, dim=-1)
-        top1_prob = probs.max().item()
-        topk = torch.topk(scores, 2, dim=-1).values
-        logit_margin = (topk[..., 0] - topk[..., 1]).mean().item()
-        return top1_prob > self.confidence_threshold and logit_margin > self.margin_threshold
-
-# === DenPAD Adaptive Processor (Final Unified Version) ===
+# === DenPAD Adaptive Processor (Corrected Logic) ===
 class AdaptiveNoiseProcessor(LogitsProcessor):
     def __init__(self, epsilon_base=1.0, alpha=10.0, delta=1e-5, 
                  enable_screening=True, enable_calibration=True,
                  density_map_path=None,  
                  ablation_mode="full",
-                 noise_amplification=2.0, min_sensitivity=0.5):
+                 noise_amplification=3.0, 
+                 min_sensitivity=0.0,
+                 tokenizer=None,
+                 dataset_name="healthcaremagic"):
         
-        self.base_scale = 0.01 / max(epsilon_base, 0.01)
         self.epsilon_base = epsilon_base
         self.accountant = RDPAccountant(alpha=alpha, delta=delta)
-        self.step_count = 0
         
-        self.noise_amplification = noise_amplification
-        self.min_sensitivity = min_sensitivity
-        self.min_sigma = 0.01
-        self.max_sigma = 10.0
+        # 3-gram Radar
+        self.history_len = 3
+        self.context_ngrams = set()
         
-        self.calibrator = DataDependentCalibrator() if enable_calibration else None
-        self.screener = ScreeningMechanism() if enable_screening else None
-        self.ablation_mode = ablation_mode
-
         self.density_analyzer = None
         if density_map_path:
             self.density_analyzer = DensityAnalyzer(density_map_path)
-            
-        self.log_eps = np.log(epsilon_base)
+        
+        # Threshold: conservative
+        self.safe_rank_threshold = 0.8
+        
+        print(f">>> [DEBUG] Corrected DenPAD. Threshold={self.safe_rank_threshold:.4f}")
+
+    def set_context(self, context_ids):
+        self.context_ngrams.clear()
+        if not context_ids or len(context_ids) < self.history_len: return
+        if isinstance(context_ids, torch.Tensor):
+            context_ids = context_ids.tolist()
+            if isinstance(context_ids[0], list): context_ids = context_ids[0]
+        
+        self.context_tokens = set(context_ids)
+        for i in range(len(context_ids) - self.history_len + 1):
+            ngram = tuple(context_ids[i : i + self.history_len])
+            self.context_ngrams.add(ngram)
 
     def __call__(self, input_ids, scores):
-        self.step_count += 1
+        # 1. Base PPL Protection: Top-20 Truncation
+        top_k_scores, top_k_indices = torch.topk(scores, 20, dim=-1)
+        mask = torch.ones_like(scores, dtype=torch.bool)
+        mask.scatter_(1, top_k_indices, False)
+        scores.masked_fill_(mask, -float('inf'))
         
-        # 1. Look-ahead: 获取预测 Token 的几何属性
+        # 2. Radar & Density Check
         top_token_id = torch.argmax(scores, dim=-1).item()
-        density_sensitivity = 0.0
-        current_density = 1.0 # 默认为满密度
+        current_history = tuple(input_ids[0, -self.history_len:].tolist())
+        is_in_context_sequence = current_history in self.context_ngrams
         
+        percentile = 0.0
         if self.density_analyzer:
-            density_sensitivity = self.density_analyzer.get_token_sensitivity(top_token_id)
-            current_density = self.density_analyzer.get_token_density(top_token_id)
+            percentile = self.density_analyzer.get_token_rank(top_token_id)
         
-        # 2. Screening (第一道防线：筛选)
-        # 注意：这里我们移除了 is_high_risk 的硬性阻断，
-        # 因为 Unified Calibration 可以在下一步产生足够大的噪声，
-        # 即使 Screening 跳过了，我们依然可以通过 RDP 记录来保证隐私（或者在此处保留软筛选）。
-        # 但为了稳妥，对于极高风险的词（Pure Density Sensitivity 很高），
-        # 我们依然建议在这里做一个隐式的保护：不跳过。
+        # === KEY FIX: Only intervene on RARE tokens ===
+        # If the word is common (e.g., "the", "with"), we let it pass even if it's in context.
+        # This prevents breaking grammar.
+        # We only break the chain when it hits a specific entity.
+        should_intervene = is_in_context_sequence and (percentile <= self.safe_rank_threshold)
         
-        skip_noise = False
-        if self.screener and self.screener.should_skip_noise(scores):
-            # 如果是极其敏感的词 (density < 0.5)，我们倾向于不信任 Screening
-            if density_sensitivity > 0.5:
-                skip_noise = False
-            else:
-                skip_noise = True
-        
-        if skip_noise:
-            minimal_noise = torch.randn_like(scores) * self.min_sigma
-            self.accountant.add_gaussian_step(sensitivity=0.0, sigma=self.min_sigma, noise_injected=True)
-            return scores + minimal_noise
-        
-        # 3. Sensitivity Calculation (Pure Density Driven)
-        final_sensitivity = density_sensitivity
-        final_sensitivity = max(final_sensitivity, self.min_sensitivity)
-        
-        # 4. Noise Calibration (Unified Manifold-Aware)
-        # 直接调用统一校准器，无需 Bypass 逻辑
-        if self.calibrator:
-            sigma = self.calibrator.calibrate_noise_scale(
-                scores, 
-                self.step_count, 
-                self.base_scale, 
-                density=current_density # 传入密度，让公式自动处理
-            )
-        else:
-            sigma = self.base_scale
+        # 3. Smart Swap Strategy
+        if should_intervene:
+            candidates = top_k_indices[0].tolist()
+            best_replacement = None
+            best_replacement_score = -float('inf')
+            current_max_logit = scores[0, top_token_id].item()
             
-        # 5. Injection
-        sigma_final = sigma * (final_sensitivity / self.epsilon_base) * self.noise_amplification
-        sigma_final = min(self.max_sigma, max(self.min_sigma, sigma_final))
-        
+            for idx in candidates:
+                if idx == top_token_id: continue 
+                
+                # === KEY FIX: Relaxed Filter ===
+                # We allow context words if they are safe/common.
+                # We trust the weighted score to pick good ones.
+                
+                cand_rank = self.density_analyzer.get_token_rank(idx) if self.density_analyzer else 0.5
+                original_score = scores[0, idx].item()
+                logit_diff = original_score - current_max_logit 
+                
+                # Preference: Semantic closeness (Logit) + Commonness (Rank)
+                weighted_score = logit_diff + (cand_rank * 5.0)
+                
+                if weighted_score > best_replacement_score:
+                    best_replacement_score = weighted_score
+                    best_replacement = idx
+            
+            if best_replacement is not None:
+                # Boost the safe synonym
+                scores[0, best_replacement] = current_max_logit + 0.5
+                scores[0, top_token_id] = current_max_logit - 0.5
+                
+        # 4. Minimal DP Noise
+        final_sensitivity = 0.1 
+        sigma_final = 2.0 
         noise = torch.randn_like(scores) * sigma_final
-        self.accountant.add_gaussian_step(sensitivity=final_sensitivity, sigma=sigma_final, noise_injected=True)
+        noisy_scores = scores + noise
         
-        return scores + noise
+        self.accountant.add_gaussian_step(sensitivity=final_sensitivity, sigma=sigma_final, noise_injected=True)
+        return noisy_scores
 
-    def get_total_privacy_loss(self):
-        return self.accountant.get_epsilon()
-    
-    def get_gamma(self):
-        return self.accountant.get_gamma()
+    def get_total_privacy_loss(self): return self.accountant.get_total_privacy_loss()
+    def get_gamma(self): return 1.0
 
-# === LLM Engine (Wrapper) ===
+# === LLMEngine ===
 class LLMEngine:
     def __init__(self, model, tokenizer=None, add_noise=False, epsilon=1.0, 
                  alpha=10.0, delta=1e-5, enable_screening=True, 
@@ -252,7 +214,9 @@ class LLMEngine:
                  lprag_epsilon=3.0, 
                  ablation_mode="full", 
                  noise_amplification=2.0, min_sensitivity=0.5,
-                 noise_type="adaptive", static_noise_scale=0.1, verbose=False):
+                 noise_type="adaptive", static_noise_scale=0.1, 
+                 dataset="healthcaremagic",
+                 verbose=False):
         
         self.model = model
         self.tokenizer = tokenizer
@@ -260,22 +224,15 @@ class LLMEngine:
         self.epsilon = epsilon
         self.noise_type = noise_type
         self.verbose = verbose
-
         self.enable_lprag = enable_lprag
         self.lprag_perturbator = None
         
-        if self.enable_lprag:
-            if not LPRAG_AVAILABLE:
-                raise ValueError("Cannot enable LPRAG: dependencies missing.")
-            print("Initializing LPRAG PrivacyPerturbator...")
+        if self.enable_lprag and LPRAG_AVAILABLE:
             self.lprag_perturbator = PrivacyPerturbator(total_epsilon=lprag_epsilon)
         
         if add_noise:
             if noise_type == "static":
-                self.noise_processor = StaticNoiseProcessor(
-                    epsilon_base=epsilon, alpha=alpha, delta=delta,
-                    noise_scale=static_noise_scale
-                )
+                self.noise_processor = StaticNoiseProcessor(epsilon_base=epsilon, alpha=alpha, delta=delta, noise_scale=static_noise_scale)
             else:
                 self.noise_processor = AdaptiveNoiseProcessor(
                     epsilon_base=epsilon, alpha=alpha, delta=delta,
@@ -283,107 +240,76 @@ class LLMEngine:
                     enable_calibration=enable_calibration,
                     density_map_path=density_map_path, 
                     ablation_mode=ablation_mode,
-                    noise_amplification=noise_amplification,
-                    min_sensitivity=min_sensitivity
+                    noise_amplification=2.0, 
+                    min_sensitivity=0.0,
+                    tokenizer=tokenizer,
+                    dataset_name=dataset
                 )
         else:
             self.noise_processor = None
 
     def generate(self, prompt: str, **decoding_kwargs) -> str:
-        if not self.model or not self.tokenizer:
-            raise ValueError("Both model and tokenizer must be provided.")
+        if not self.model or not self.tokenizer: raise ValueError("Model/Tokenizer missing")
         final_prompt = prompt
-
+        
+        context_text = ""
+        if "Context:\n" in prompt and "\n\nQuestion:" in prompt:
+            try:
+                start = prompt.find("Context:\n") + len("Context:\n")
+                end = prompt.find("\n\nQuestion:")
+                context_text = prompt[start:end]
+            except: pass
+        
         if self.enable_lprag and self.lprag_perturbator:
             try:
-                bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-                tokenized_ids = bert_tokenizer.encode(prompt, add_special_tokens=False)
-                if len(tokenized_ids) > 510:
-                    tokenized_ids = tokenized_ids[:510]
-                    truncated_prompt = bert_tokenizer.decode(tokenized_ids, skip_special_tokens=True)
-                else:
-                    truncated_prompt = prompt
-                final_prompt = self.lprag_perturbator.perturb(truncated_prompt)
-            except Exception as e:
-                print(f"Error during LPRAG perturbation: {e}")
-                final_prompt = prompt
-
-        inputs = self.tokenizer(final_prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"]
-        
-        max_new_tokens = decoding_kwargs.get("max_new_tokens", 256)
-        model_max_length = getattr(self.model.config, "max_position_embeddings", 2048)
-        safe_max_input_len = model_max_length - max_new_tokens - 32
-        
-        current_len = input_ids.shape[1]
-        if current_len > safe_max_input_len:
-            input_ids = input_ids[:, -safe_max_input_len:]
-            inputs["input_ids"] = input_ids
-            if "attention_mask" in inputs:
-                inputs["attention_mask"] = inputs["attention_mask"][:, -safe_max_input_len:]
-        
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-
-        if "pad_token_id" not in decoding_kwargs:
-            decoding_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
+                bert_tok = BertTokenizer.from_pretrained('bert-base-uncased')
+                tids = bert_tok.encode(prompt, add_special_tokens=False)[:510]
+                final_prompt = self.lprag_perturbator.perturb(bert_tok.decode(tids))
+            except: pass
             
+        inputs = self.tokenizer(final_prompt, return_tensors="pt")
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
         if self.add_noise and self.noise_processor:
-            if "logits_processor" not in decoding_kwargs:
-                decoding_kwargs["logits_processor"] = [self.noise_processor]
+            if context_text:
+                ctx_ids = self.tokenizer(context_text, add_special_tokens=False)["input_ids"]
+                self.noise_processor.set_context(ctx_ids)
             else:
-                decoding_kwargs["logits_processor"].append(self.noise_processor)
-        
+                self.noise_processor.set_context([])
+
+        max_new = decoding_kwargs.get("max_new_tokens", 256)
+        safe_len = 2048 - max_new - 32
+        if inputs["input_ids"].shape[1] > safe_len:
+            inputs["input_ids"] = inputs["input_ids"][:, -safe_len:]
+            if "attention_mask" in inputs: inputs["attention_mask"] = inputs["attention_mask"][:, -safe_len:]
+        if "pad_token_id" not in decoding_kwargs: decoding_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
+        if self.add_noise and self.noise_processor:
+            if "logits_processor" not in decoding_kwargs: decoding_kwargs["logits_processor"] = [self.noise_processor]
+            else: decoding_kwargs["logits_processor"].append(self.noise_processor)
         output_ids = self.model.generate(**inputs, **decoding_kwargs)
-        generated_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
-        response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-        if self.add_noise and self.verbose:
-            epsilon = self.get_total_privacy_loss()
-            gamma = self.get_gamma()
-            print(f"[DP Log] Cumulative ε: {epsilon:.4f}")
-            if gamma is not None:
-                print(f"[DP Log] γ: {gamma:.3f}")
+        response = self.tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        if self.add_noise and self.verbose: print(f"[DP Log] Privacy Loss: {self.get_total_privacy_loss()}")
         return response
 
-    def get_total_privacy_loss(self):
-        if self.add_noise and hasattr(self.noise_processor, "get_total_privacy_loss"):
-            return self.noise_processor.get_total_privacy_loss()
-        return None
-    
-    def get_gamma(self):
-        if self.add_noise and hasattr(self.noise_processor, "get_gamma"):
-            return self.noise_processor.get_gamma()
-        return None
+    def get_total_privacy_loss(self): return self.noise_processor.get_total_privacy_loss() if self.noise_processor else None
+    def get_gamma(self): return self.noise_processor.get_gamma() if self.noise_processor else None
 
-# === Standard RAG Pipeline (Unchanged) ===
 class RAGPipeline:
-    def __init__(self, retriever, llm, reranker_model: str = "BAAI/bge-reranker-large", device: str = "auto"):
+    def __init__(self, retriever, llm, reranker_model="BAAI/bge-reranker-large", device="auto"):
         self.retriever = retriever
         self.llm = llm
-        if device == "auto":
-            reranker_device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            reranker_device = device
+        reranker_device = "cuda" if torch.cuda.is_available() and device=="auto" else "cpu"
         self.reranker = CrossEncoder(reranker_model, device=reranker_device)
-
-    def rerank_contexts(self, question: str, docs, top_n: int = 3):
+    def rerank_contexts(self, question, docs, top_n=3):
         if not docs: return []
-        pairs = [[question, doc.page_content] for doc in docs]
+        pairs = [[question, d.page_content] for d in docs]
         scores = self.reranker.predict(pairs, show_progress_bar=False)
         doc_scores = list(zip(docs, scores))
         doc_scores.sort(key=lambda x: x[1], reverse=True)
         return [doc for doc, _ in doc_scores[:top_n]]
-
-    def run(self, question: str, k: int = 6, top_n: int = 3, **decoding_kwargs) -> dict:
+    def run(self, question, k=6, top_n=3, **kwargs):
         docs = self.retriever.similarity_search(question, k=k)
         top_docs = self.rerank_contexts(question, docs, top_n=top_n)
-        retrieved_text = "\n\n".join(d.page_content for d in top_docs)
-        prompt = (f"Context:\n{retrieved_text}\n\nQuestion:{question}\nAnswer:\n")
-        answer = self.llm.generate(prompt, **decoding_kwargs)
-        result = {
-            "question": question,
-            "context": retrieved_text,
-            "answer": answer,
-            "retrieved_docs": [d.page_content for d in top_docs],
-        }
-        return result
+        context = "\n\n".join(d.page_content for d in top_docs)
+        prompt = f"[INST] Use the following context to answer the question.\n\nContext:\n{context}\n\nQuestion: {question} [/INST]"
+        return {"question": question, "context": context, "answer": self.llm.generate(prompt, **kwargs), "retrieved_docs": [d.page_content for d in top_docs]}
