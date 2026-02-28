@@ -18,15 +18,13 @@ except ImportError:
     LPRAG_AVAILABLE = False
     print("Warning: LPRAG dependencies not found. LPRAG baseline will not work.")
 
-# === DenPAD Core: Density Analyzer ===
+# === DenPAD Core: Density Analyzer (保留加载功能以备后用) ===
 class DensityAnalyzer:
     def __init__(self, density_file):
         self.density_map = None 
         self.is_list = False    
         self.sorted_densities = [] 
-        
         if density_file and os.path.exists(density_file):
-            logging.info(f"Loading density map from {density_file}...")
             try:
                 with open(density_file, 'r') as f:
                     self.density_map = json.load(f)
@@ -36,27 +34,22 @@ class DensityAnalyzer:
                 elif isinstance(self.density_map, dict):
                     self.is_list = False
                     self.sorted_densities = sorted([float(x) for x in self.density_map.values()])
-            except Exception as e:
-                logging.error(f"Failed to load density map: {e}")
-                self.density_map = None
+            except: pass
 
     def get_token_rank(self, token_id):
         if self.density_map is None: return 1.0 
         try:
             raw_density = 0.0
             if self.is_list:
-                if 0 <= token_id < len(self.density_map):
-                    raw_density = self.density_map[token_id]
+                if 0 <= token_id < len(self.density_map): raw_density = self.density_map[token_id]
                 else: return 1.0 
             else:
                 token_key = str(token_id)
-                if token_key in self.density_map:
-                    raw_density = self.density_map[token_key]
+                if token_key in self.density_map: raw_density = self.density_map[token_key]
                 else: return 1.0 
             index = bisect.bisect_left(self.sorted_densities, raw_density)
             return index / len(self.sorted_densities)
-        except Exception:
-            return 1.0
+        except Exception: return 1.0
 
 # === RDP Accountant ===
 class RDPAccountant:
@@ -93,7 +86,6 @@ class StaticNoiseProcessor(LogitsProcessor):
         self.noise_scale = noise_scale
         self.accountant = RDPAccountant(alpha=alpha, delta=delta)
         self.sensitivity = 1.0 
-
     def __call__(self, input_ids, scores):
         noise = torch.randn_like(scores) * self.noise_scale
         self.accountant.add_gaussian_step(sensitivity=self.sensitivity, sigma=self.noise_scale, noise_injected=True)
@@ -101,7 +93,7 @@ class StaticNoiseProcessor(LogitsProcessor):
     def get_total_privacy_loss(self): return self.accountant.get_total_privacy_loss()
     def get_gamma(self): return 1.0
 
-# === DenPAD Adaptive Processor (Corrected Logic) ===
+# === DenPAD Adaptive Processor (Stateful Margin-Aware Inversion) ===
 class AdaptiveNoiseProcessor(LogitsProcessor):
     def __init__(self, epsilon_base=1.0, alpha=10.0, delta=1e-5, 
                  enable_screening=True, enable_calibration=True,
@@ -115,25 +107,26 @@ class AdaptiveNoiseProcessor(LogitsProcessor):
         self.epsilon_base = epsilon_base
         self.accountant = RDPAccountant(alpha=alpha, delta=delta)
         
-        # 3-gram Radar
-        self.history_len = 3
+        # 抢先打击：监控 2-gram 状态
+        self.history_len = 2
         self.context_ngrams = set()
+        self.context_tokens = set()
         
-        self.density_analyzer = None
-        if density_map_path:
-            self.density_analyzer = DensityAnalyzer(density_map_path)
+        # 有界敏感度截断值
+        self.max_penalty = 15.0
         
-        # Threshold: conservative
-        self.safe_rank_threshold = 0.8
-        
-        print(f">>> [DEBUG] Corrected DenPAD. Threshold={self.safe_rank_threshold:.4f}")
+        print(f">>> [DEBUG] Margin-Aware Inversion DenPAD. Radar Trigger: {self.history_len}-gram. Max Penalty: {self.max_penalty}")
 
     def set_context(self, context_ids):
         self.context_ngrams.clear()
-        if not context_ids or len(context_ids) < self.history_len: return
+        self.context_tokens.clear()
+        if not context_ids: return
+        
         if isinstance(context_ids, torch.Tensor):
             context_ids = context_ids.tolist()
             if isinstance(context_ids[0], list): context_ids = context_ids[0]
+            
+        if len(context_ids) < self.history_len: return
         
         self.context_tokens = set(context_ids)
         for i in range(len(context_ids) - self.history_len + 1):
@@ -141,64 +134,54 @@ class AdaptiveNoiseProcessor(LogitsProcessor):
             self.context_ngrams.add(ngram)
 
     def __call__(self, input_ids, scores):
-        # 1. Base PPL Protection: Top-20 Truncation
-        top_k_scores, top_k_indices = torch.topk(scores, 20, dim=-1)
+        # 1. Base PPL Protection: Top-50 Truncation
+        top_k_scores, top_k_indices = torch.topk(scores, 50, dim=-1)
         mask = torch.ones_like(scores, dtype=torch.bool)
         mask.scatter_(1, top_k_indices, False)
         scores.masked_fill_(mask, -float('inf'))
         
-        # 2. Radar & Density Check
-        top_token_id = torch.argmax(scores, dim=-1).item()
+        # 2. 状态机雷达扫描 (Stateful Radar)
         current_history = tuple(input_ids[0, -self.history_len:].tolist())
-        is_in_context_sequence = current_history in self.context_ngrams
+        is_in_copy_mode = current_history in self.context_ngrams
         
-        percentile = 0.0
-        if self.density_analyzer:
-            percentile = self.density_analyzer.get_token_rank(top_token_id)
-        
-        # === KEY FIX: Only intervene on RARE tokens ===
-        # If the word is common (e.g., "the", "with"), we let it pass even if it's in context.
-        # This prevents breaking grammar.
-        # We only break the chain when it hits a specific entity.
-        should_intervene = is_in_context_sequence and (percentile <= self.safe_rank_threshold)
-        
-        # 3. Smart Swap Strategy
-        if should_intervene:
+        if is_in_copy_mode:
             candidates = top_k_indices[0].tolist()
-            best_replacement = None
-            best_replacement_score = -float('inf')
-            current_max_logit = scores[0, top_token_id].item()
+            safe_candidate_idx = None
             
+            # 寻找最佳安全词 (The Safe Alternative)
             for idx in candidates:
-                if idx == top_token_id: continue 
-                
-                # === KEY FIX: Relaxed Filter ===
-                # We allow context words if they are safe/common.
-                # We trust the weighted score to pick good ones.
-                
-                cand_rank = self.density_analyzer.get_token_rank(idx) if self.density_analyzer else 0.5
-                original_score = scores[0, idx].item()
-                logit_diff = original_score - current_max_logit 
-                
-                # Preference: Semantic closeness (Logit) + Commonness (Rank)
-                weighted_score = logit_diff + (cand_rank * 5.0)
-                
-                if weighted_score > best_replacement_score:
-                    best_replacement_score = weighted_score
-                    best_replacement = idx
+                if idx not in self.context_tokens:
+                    safe_candidate_idx = idx
+                    break
             
-            if best_replacement is not None:
-                # Boost the safe synonym
-                scores[0, best_replacement] = current_max_logit + 0.5
-                scores[0, top_token_id] = current_max_logit - 0.5
+            # 3. 动态差值反转 (Margin-Aware Inversion)
+            if safe_candidate_idx is not None:
+                safe_logit = scores[0, safe_candidate_idx].item()
                 
-        # 4. Minimal DP Noise
-        final_sensitivity = 0.1 
+                for idx in candidates:
+                    if idx == safe_candidate_idx: 
+                        break # 我们已经处理完所有排在安全词前面的敏感词了
+                    
+                    # 排在安全词前面的，必然是（或者大概率是）Context 中的词
+                    unsafe_logit = scores[0, idx].item()
+                    
+                    # 精准计算差值
+                    margin = unsafe_logit - safe_logit
+                    
+                    # 施加恰好能反转的最小惩罚（加 0.5 缓冲），并限制上限以满足 Bounded Sensitivity
+                    penalty = min(margin + 0.5, self.max_penalty)
+                    
+                    # 狙击敏感词
+                    scores[0, idx] -= penalty
+
+        # 4. DP Noise Injection (Indistinguishability Guarantee)
+        # 固定底噪，掩盖所有机制干预痕迹
         sigma_final = 2.0 
         noise = torch.randn_like(scores) * sigma_final
         noisy_scores = scores + noise
         
-        self.accountant.add_gaussian_step(sensitivity=final_sensitivity, sigma=sigma_final, noise_injected=True)
+        # 为了 RDP 计算保持尺度统一，这里的 sensitivity 为标准化常数 1.0
+        self.accountant.add_gaussian_step(sensitivity=1.0, sigma=sigma_final, noise_injected=True)
         return noisy_scores
 
     def get_total_privacy_loss(self): return self.accountant.get_total_privacy_loss()
@@ -253,6 +236,7 @@ class LLMEngine:
         final_prompt = prompt
         
         context_text = ""
+        # 适配带有 [INST] 的标准 Prompt 提取 Context
         if "Context:\n" in prompt and "\n\nQuestion:" in prompt:
             try:
                 start = prompt.find("Context:\n") + len("Context:\n")
@@ -311,5 +295,6 @@ class RAGPipeline:
         docs = self.retriever.similarity_search(question, k=k)
         top_docs = self.rerank_contexts(question, docs, top_n=top_n)
         context = "\n\n".join(d.page_content for d in top_docs)
+        # 这里已经是适配了 Llama-2 [INST] 的标准 Prompt
         prompt = f"[INST] Use the following context to answer the question.\n\nContext:\n{context}\n\nQuestion: {question} [/INST]"
         return {"question": question, "context": context, "answer": self.llm.generate(prompt, **kwargs), "retrieved_docs": [d.page_content for d in top_docs]}

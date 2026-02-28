@@ -411,7 +411,7 @@ def main():
                 max_new_tokens=args.max_tokens,
                 temperature=args.temperature,
                 do_sample=True,
-                # repetition_penalty=1.1 #1.1的效果很好
+                repetition_penalty=1.1 #1.1的效果很好
                 # repetition_penalty=1.0
             )
             
