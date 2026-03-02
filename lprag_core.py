@@ -13,11 +13,16 @@ class PrivacyPerturbator:
     def __init__(self, total_epsilon=3.0):
         self.total_epsilon = total_epsilon
         self.skip_words = {"year", "years", "old", "decade", "decades", "month", "months", "day", "days"}
-        self.nlp = spacy.load("en_core_web_trf")
+        try:
+            self.nlp = spacy.load("en_core_web_trf")
+        except OSError:
+            self.nlp = spacy.load("en_core_web_sm")
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+        self.bert_model.eval()
         self.word2vec_model = api.load('word2vec-google-news-300')
         self.classifier = self._train_classifier(self._get_default_train_data())
+        self.classifier.eval()
 
     class SimpleClassifier(torch.nn.Module):
         def __init__(self, hidden_size):
@@ -62,6 +67,8 @@ class PrivacyPerturbator:
         return classifier
 
     def _compute_privacy_budget(self, text, entities):
+        if not entities:
+            return {}
         inputs = self.tokenizer(text, return_tensors="pt")
         with torch.no_grad():
             outputs = self.bert_model(**inputs)
@@ -79,6 +86,13 @@ class PrivacyPerturbator:
             entity_norms[ent.text] = avg_norm
 
         total_weight = sum(entity_norms.values())
+        if total_weight <= 0:
+            fallback_eps = self.total_epsilon / max(len(entity_token_map), 1)
+            return {
+                tok: fallback_eps / max(len(tokens), 1)
+                for _, tokens in entity_token_map.items()
+                for tok in tokens
+            }
         entity_epsilons = {
             ent_text: self.total_epsilon * (entity_norms[ent_text] / total_weight)
             for ent_text in entity_token_map

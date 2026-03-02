@@ -3,7 +3,6 @@ import json
 import logging
 import argparse
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,6 +16,99 @@ from utils import *
 from utils import find_all_file, get_encoding_of_file
 
 logging.basicConfig(level=logging.INFO)
+
+
+def validate_method_args(args):
+    method = args.method
+
+    if method == "baseline":
+        if args.density_map:
+            raise ValueError("--density_map is only valid for method=denpad")
+    elif method == "pad":
+        if args.density_map:
+            raise ValueError("--density_map is only valid for method=denpad")
+    elif method == "lprag":
+        if args.density_map:
+            raise ValueError("--density_map is only valid for method=denpad")
+    elif method == "denpad":
+        pass
+    else:
+        raise ValueError(f"Unsupported method: {method}")
+
+
+def build_documents_for_method(documents, args):
+    if args.method != "lprag":
+        return documents
+
+    from lprag_core import PrivacyPerturbator
+
+    logging.info("Initializing LPRAG perturbator for corpus-side entity perturbation...")
+    perturbator = PrivacyPerturbator(total_epsilon=args.lprag_epsilon)
+    perturbed_documents = []
+
+    for doc in tqdm(documents, desc="Applying LPRAG to corpus"):
+        original_text = doc.page_content
+        try:
+            perturbed_text = perturbator.perturb(original_text)
+        except Exception as exc:
+            logging.warning("LPRAG perturbation failed for one document, falling back to original text: %s", exc)
+            perturbed_text = original_text
+
+        metadata = dict(doc.metadata)
+        metadata["original_page_content"] = original_text
+        perturbed_documents.append(Document(page_content=perturbed_text, metadata=metadata))
+
+    return perturbed_documents
+
+
+def resolve_db_name(dataset, method):
+    if method == "lprag":
+        return f"{dataset}-corpus-lprag"
+    return f"{dataset}-corpus"
+
+
+def resolve_db_paths(builder, args):
+    if args.method == "lprag":
+        db_name = resolve_db_name(args.dataset, args.method)
+        persist_path = os.path.join(builder.persist_root, db_name, args.retriever_model)
+        return {
+            "db_name": db_name,
+            "persist_path": persist_path,
+            "legacy_persist_path": None,
+        }
+
+    db_name = resolve_db_name(args.dataset, args.method)
+    persist_path = os.path.join(builder.persist_root, db_name, args.retriever_model)
+    legacy_db_name = f"{args.dataset}-corpus/{args.retriever_model}"
+    legacy_persist_path = os.path.join(builder.persist_root, legacy_db_name, args.retriever_model)
+    return {
+        "db_name": db_name,
+        "persist_path": persist_path,
+        "legacy_persist_path": legacy_persist_path,
+        "legacy_db_name": legacy_db_name,
+    }
+
+
+def construct_method_database(builder, documents, args):
+    resolved = resolve_db_paths(builder, args)
+    db_name = resolved["db_name"]
+    persist_path = resolved["persist_path"]
+    legacy_persist_path = resolved.get("legacy_persist_path")
+
+    if legacy_persist_path and os.path.exists(legacy_persist_path) and os.listdir(legacy_persist_path):
+        logging.info("Legacy Chroma DB found at %s. Loading for backward compatibility...", legacy_persist_path)
+        return builder.load(legacy_persist_path, args.retriever_model)
+
+    if os.path.exists(persist_path) and os.listdir(persist_path):
+        logging.info("Chroma DB already exists at %s. Loading without rebuilding...", persist_path)
+        return builder.load(persist_path, args.retriever_model)
+
+    method_docs = build_documents_for_method(documents, args)
+    return builder.construct_from_documents(
+        documents=method_docs,
+        encoder_model_name=args.retriever_model,
+        db_name=db_name,
+    )
 
 
 def setup_tokenizer_model(name: str, device: str = "auto"):
@@ -64,12 +156,14 @@ def main():
     # === Argument Parsing ===
     parser = argparse.ArgumentParser(description="Privacy-Preserving RAG Pipeline")
     
-    # Core privacy parameters
     parser.add_argument(
-        "--add_noise",
-        action="store_true",
-        help="Enable differential privacy noise injection for privacy-preserving decoding."
+        "--method",
+        type=str,
+        choices=["baseline", "pad", "lprag", "denpad"],
+        required=True,
+        help="Mutually exclusive method choice for comparison experiments.",
     )
+
     parser.add_argument(
         "--noise_amplification",
         type=float,
@@ -90,6 +184,12 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=256, help="Maximum tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling parameter")
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.1,
+        help="Shared generation hyperparameter across all methods. Set to 1.0 to disable.",
+    )
     
     # Model and system configuration
     parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-6.9b", help="Language model to use")
@@ -148,8 +248,6 @@ def main():
         help="Ablation mode for sensitivity calculation."
     )
 
-    # LPRAG Baseline Arguments
-    parser.add_argument("--enable_lprag", action="store_true", help="Enable LPRAG input perturbation baseline.")
     parser.add_argument("--lprag_epsilon", type=float, default=3.0, help="Privacy budget for LPRAG.")
     
     # Corpus preprocessing options
@@ -167,29 +265,40 @@ def main():
     )
     
     args = parser.parse_args()
+    validate_method_args(args)
 
     # === Logging Configuration ===
     if args.verbose:
         logging.info("Starting Privacy-Preserving RAG Pipeline")
+        logging.info(f"Method: {args.method}")
         logging.info(f"Model: {args.model_name}")
         logging.info(f"Retriever: {args.retriever_model}")
         logging.info(f"Device: {args.device}")
         
         # Log privacy configuration
-        if args.add_noise:
-            if args.noise_type == "static":
+        if args.method in {"pad", "denpad"}:
+            if args.method == "pad" and args.noise_type == "static":
                 logging.info(f"Static Baseline DP: ε={args.epsilon} | δ={args.delta} | noise_scale={args.static_noise_scale}")
             else:
-                logging.info(f"Adaptive DP: ε={args.epsilon} | δ={args.delta}")
+                logging.info(f"Decoding DP: ε={args.epsilon} | δ={args.delta}")
                 logging.info(f"Features: screening={not args.disable_screening}, calibration={not args.disable_calibration}")
                 logging.info(f"Enhancement: amplification={args.noise_amplification}, min_sensitivity={args.min_sensitivity}")
+                if args.method == "denpad" and args.density_map:
+                    logging.info(f"DenPAD density map: {args.density_map}")
+        elif args.method == "lprag":
+            logging.info(f"LPRAG entity perturbation: ε={args.lprag_epsilon}")
         else:
-            logging.info("No noise-based privacy protection enabled")
+            logging.info("No privacy protection enabled")
         
-        logging.info(f"Generation parameters: temp={args.temperature}, top_p={args.top_p}, max_tokens={args.max_tokens}")
+        logging.info(
+            "Generation parameters: temp=%s, top_p=%s, max_tokens=%s, repetition_penalty=%s",
+            args.temperature,
+            args.top_p,
+            args.max_tokens,
+            args.repetition_penalty,
+        )
     else:
-        # Minimal logging for non-verbose mode
-        print(f"Running PAD with {args.dataset} dataset, {'DP enabled' if args.add_noise else 'no DP'}")
+        print(f"Running {args.method} on {args.dataset}")
 
     # === Directory Setup ===
     corpus_dir = "corpus"
@@ -269,7 +378,6 @@ def main():
         logging.info(f"Loading test prompts from {prompt_file}")
         with open(prompt_file, "r", encoding="utf-8") as f:
             prompts = json.load(f)
-        df_with_prompts = pd.DataFrame({"prompt": prompts})
         logging.info(f"Loaded {len(prompts)} test prompts from {prompt_file}")
     else:
         logging.error(f"Prompt file {prompt_file} not found.")
@@ -299,11 +407,7 @@ def main():
         builder = RetrievalDatabaseBuilder(device=args.device)
         persist_path = f"./RetrievalBase/{args.dataset}-corpus/{args.retriever_model}"
 
-        db = builder.construct_from_documents(
-            documents=split_docs,
-            encoder_model_name=args.retriever_model,
-            db_name=f"{args.dataset}-corpus/{args.retriever_model}",
-        )
+        db = construct_method_database(builder, split_docs, args)
     else:
         # Load and process other datasets (healthcaremagic, icliniq)
         logging.info(f"Loading corpus from {raw_file}")
@@ -325,11 +429,7 @@ def main():
         builder = RetrievalDatabaseBuilder(device=args.device)
         persist_path = f"./RetrievalBase/{args.dataset}-corpus/{args.retriever_model}"
 
-        db = builder.construct_from_documents(
-            documents=split_docs,
-            encoder_model_name=args.retriever_model,
-            db_name=f"{args.dataset}-corpus/{args.retriever_model}",
-        )
+        db = construct_method_database(builder, split_docs, args)
 
     # === [Modification] Build Ground Truth Table ===
     # 新增: 构建 Ground Truth 查找表，以便在生成时注入
@@ -354,7 +454,7 @@ def main():
     llm = LLMEngine(
         model=model,
         tokenizer=tokenizer,
-        add_noise=args.add_noise,
+        method=args.method,
         epsilon=args.epsilon,
         alpha=args.alpha,
         delta=args.delta,
@@ -363,9 +463,6 @@ def main():
         
         # [新增] DenPAD 参数
         density_map_path=args.density_map,
-        # 新增 LPRAG 参数
-        enable_lprag=args.enable_lprag,
-        lprag_epsilon=args.lprag_epsilon,
         # 新增消融开关
         ablation_mode=args.ablation_mode,
         
@@ -392,9 +489,7 @@ def main():
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
     # Process each test prompt
-    for i, prompt in enumerate(
-        tqdm(df_with_prompts["prompt"], desc="Generating RAG responses")
-    ):
+    for i, prompt in enumerate(tqdm(prompts, desc="Generating RAG responses")):
         try:
             # === [MODIFICATION FOR REPRODUCIBILITY] ===
             # Ensure Enron prompts contain the attack command as described in "The Good and The Bad" paper.
@@ -411,8 +506,7 @@ def main():
                 max_new_tokens=args.max_tokens,
                 temperature=args.temperature,
                 do_sample=True,
-                repetition_penalty=1.1 #1.1的效果很好
-                # repetition_penalty=1.0
+                repetition_penalty=args.repetition_penalty,
             )
             
             # Track privacy loss if noise injection is enabled

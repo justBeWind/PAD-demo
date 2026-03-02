@@ -43,6 +43,7 @@ for DATASET in "${DATASETS[@]}"; do
     # --- Experiment A: Baseline ---
     echo "[${DATASET}] Running Baseline..."
     python generate.py \
+        --method baseline \
         --dataset $DATASET \
         --model_name $MODEL \
         --retriever_model $RETRIEVER \
@@ -53,12 +54,12 @@ for DATASET in "${DATASETS[@]}"; do
     # --- Experiment B: PAD (Standard: eps=0.2, amp=3.0) ---
     echo "[${DATASET}] Running PAD..."
     python generate.py \
+        --method pad \
         --dataset $DATASET \
         --model_name $MODEL \
         --retriever_model $RETRIEVER \
         --temperature 0.2 \
         --max_tokens 256 \
-        --add_noise \
         --epsilon 0.2 \
         --noise_amplification 3.0 \
         --min_sensitivity 0.4 \
@@ -67,24 +68,24 @@ for DATASET in "${DATASETS[@]}"; do
     # --- Experiment C: LPRAG (Input DP: eps=3.0) ---
     echo "[${DATASET}] Running LPRAG..."
     python generate.py \
+        --method lprag \
         --dataset $DATASET \
         --model_name $MODEL \
         --retriever_model $RETRIEVER \
         --temperature 0.2 \
         --max_tokens 256 \
-        --enable_lprag \
         --lprag_epsilon 3.0 \
         --output_file "${OUTPUT_DIR}/lprag_attack.json"
 
     # --- Experiment D: DenPAD (Ours: eps=0.2, amp=3.0, Density-Aware) ---
     echo "[${DATASET}] Running DenPAD (SOTA)..."
     python generate.py \
+        --method denpad \
         --dataset $DATASET \
         --model_name $MODEL \
         --retriever_model $RETRIEVER \
         --temperature 0.2 \
         --max_tokens 256 \
-        --add_noise \
         --epsilon 0.2 \
         --noise_amplification 3.0 \
         --min_sensitivity 0.4 \
