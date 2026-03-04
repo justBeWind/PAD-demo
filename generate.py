@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import argparse
+import time
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -15,6 +16,36 @@ from langchain_core.documents import Document
 from utils import *
 from utils import find_all_file, get_encoding_of_file
 
+
+def _configure_runtime_threads() -> int:
+    """Set a safe automatic thread count for BLAS/OpenMP backends."""
+    cpu_count = os.cpu_count() or 1
+    auto_threads = max(1, min(8, cpu_count // 4 if cpu_count >= 8 else cpu_count))
+
+    def _parse_positive_int(name: str) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    resolved = _parse_positive_int("OMP_NUM_THREADS")
+    if resolved is None:
+        resolved = auto_threads
+
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        if _parse_positive_int(name) is None:
+            os.environ[name] = str(resolved)
+
+    return resolved
+
+
+RUNTIME_THREADS = _configure_runtime_threads()
+torch.set_num_threads(RUNTIME_THREADS)
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -23,53 +54,66 @@ def validate_method_args(args):
 
     if method == "baseline":
         if args.density_map:
-            raise ValueError("--density_map is only valid for method=denpad")
+            raise ValueError("--density_map is only valid for the legacy decoder-side DenPAD implementation.")
     elif method == "pad":
         if args.density_map:
-            raise ValueError("--density_map is only valid for method=denpad")
+            raise ValueError("--density_map is only valid for the legacy decoder-side DenPAD implementation.")
     elif method == "lprag":
         if args.density_map:
-            raise ValueError("--density_map is only valid for method=denpad")
+            raise ValueError("--density_map is only valid for the legacy decoder-side DenPAD implementation.")
     elif method == "denpad":
-        pass
+        if args.epsilon <= 0:
+            raise ValueError("--epsilon must be positive for method=denpad")
+        if args.density_map:
+            raise ValueError("--density_map is not used by DenPAD-L. Remove it from the command.")
     else:
         raise ValueError(f"Unsupported method: {method}")
 
 
 def build_documents_for_method(documents, args):
-    if args.method != "lprag":
-        return documents
+    if args.method == "lprag":
+        from lprag_core import PrivacyPerturbator
 
-    from lprag_core import PrivacyPerturbator
+        logging.info("Initializing LPRAG perturbator for corpus-side entity perturbation...")
+        perturbator = PrivacyPerturbator(total_epsilon=args.lprag_epsilon)
+        perturbed_documents = []
 
-    logging.info("Initializing LPRAG perturbator for corpus-side entity perturbation...")
-    perturbator = PrivacyPerturbator(total_epsilon=args.lprag_epsilon)
-    perturbed_documents = []
+        for doc in tqdm(documents, desc="Applying LPRAG to corpus"):
+            original_text = doc.page_content
+            try:
+                perturbed_text = perturbator.perturb(original_text)
+            except Exception as exc:
+                logging.warning("LPRAG perturbation failed for one document, falling back to original text: %s", exc)
+                perturbed_text = original_text
 
-    for doc in tqdm(documents, desc="Applying LPRAG to corpus"):
-        original_text = doc.page_content
-        try:
-            perturbed_text = perturbator.perturb(original_text)
-        except Exception as exc:
-            logging.warning("LPRAG perturbation failed for one document, falling back to original text: %s", exc)
-            perturbed_text = original_text
+            metadata = dict(doc.metadata)
+            metadata["original_page_content"] = original_text
+            perturbed_documents.append(Document(page_content=perturbed_text, metadata=metadata))
 
-        metadata = dict(doc.metadata)
-        metadata["original_page_content"] = original_text
-        perturbed_documents.append(Document(page_content=perturbed_text, metadata=metadata))
+        return perturbed_documents
 
-    return perturbed_documents
+    return documents
 
 
-def resolve_db_name(dataset, method):
+def format_config_value(value):
+    return str(value).replace(".", "_").replace("/", "_")
+
+
+def resolve_db_name(dataset, method, args=None):
+    debug_suffix = ""
+    if args is not None and args.debug_corpus_limit is not None:
+        debug_suffix = f"-dbg{args.debug_corpus_limit}"
+
     if method == "lprag":
-        return f"{dataset}-corpus-lprag"
+        if args is None:
+            return f"{dataset}-corpus-lprag"
+        return f"{dataset}-corpus-lprag-eps{format_config_value(args.lprag_epsilon)}{debug_suffix}"
     return f"{dataset}-corpus"
 
 
 def resolve_db_paths(builder, args):
     if args.method == "lprag":
-        db_name = resolve_db_name(args.dataset, args.method)
+        db_name = resolve_db_name(args.dataset, args.method, args)
         persist_path = os.path.join(builder.persist_root, db_name, args.retriever_model)
         return {
             "db_name": db_name,
@@ -77,7 +121,7 @@ def resolve_db_paths(builder, args):
             "legacy_persist_path": None,
         }
 
-    db_name = resolve_db_name(args.dataset, args.method)
+    db_name = resolve_db_name(args.dataset, args.method, args)
     persist_path = os.path.join(builder.persist_root, db_name, args.retriever_model)
     legacy_db_name = f"{args.dataset}-corpus/{args.retriever_model}"
     legacy_persist_path = os.path.join(builder.persist_root, legacy_db_name, args.retriever_model)
@@ -111,7 +155,22 @@ def construct_method_database(builder, documents, args):
     )
 
 
-def setup_tokenizer_model(name: str, device: str = "auto"):
+def resolve_torch_dtype(dtype_name: str, device: str = "auto"):
+    if dtype_name == "auto":
+        if torch.cuda.is_available() and device != "cpu":
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            return torch.float16
+        return torch.float32
+    mapping = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    return mapping[dtype_name]
+
+
+def setup_tokenizer_model(name: str, device: str = "auto", torch_dtype_name: str = "auto"):
     """
     Initialize tokenizer and model for text generation.
     
@@ -128,10 +187,24 @@ def setup_tokenizer_model(name: str, device: str = "auto"):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     # =================================================
+    torch_dtype = resolve_torch_dtype(torch_dtype_name, device)
+    logging.info("Loading generation model with torch_dtype=%s", torch_dtype)
     if device == "auto":
-        model = AutoModelForCausalLM.from_pretrained(name, device_map="auto")
+        model = AutoModelForCausalLM.from_pretrained(
+            name,
+            device_map="auto",
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
     else:
-        model = AutoModelForCausalLM.from_pretrained(name, device_map=device)
+        model = AutoModelForCausalLM.from_pretrained(
+            name,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
+        model = model.to(device)
+    if hasattr(model, "generation_config"):
+        model.generation_config.use_cache = True
     return tokenizer, model
 
 
@@ -176,7 +249,7 @@ def main():
         default=0.4,
         help="Minimum sensitivity bound for enhanced DP (optimal: 0.4)"
     )
-    parser.add_argument("--epsilon", type=float, default=0.2, help="Privacy epsilon parameter (optimal: 0.2)")
+    parser.add_argument("--epsilon", type=float, default=0.2, help="PAD epsilon or DenPAD-L document-level epsilon.")
     parser.add_argument("--alpha", type=float, default=10.0, help="RDP alpha parameter for composition (default: 10.0)")
     parser.add_argument("--delta", type=float, default=1e-5, help="Target delta for DP accounting")
     
@@ -184,6 +257,11 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=256, help="Maximum tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling parameter")
+    parser.add_argument(
+        "--disable_sampling",
+        action="store_true",
+        help="Disable stochastic sampling and use deterministic decoding for attack-track evaluation.",
+    )
     parser.add_argument(
         "--repetition_penalty",
         type=float,
@@ -196,6 +274,13 @@ def main():
     parser.add_argument("--output_file", type=str, default=None, help="Output file path (default: result/rag_results.json)")
     parser.add_argument("--retriever_model", type=str, default="all-MiniLM-L6-v2", help="Retriever embedding model name")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (e.g., 'cuda:0', 'cuda:7', 'cpu', 'auto')")
+    parser.add_argument(
+        "--torch_dtype",
+        type=str,
+        choices=["auto", "bfloat16", "float16", "float32"],
+        default="auto",
+        help="Torch dtype for the generation model. 'auto' prefers bf16/fp16 on CUDA.",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
@@ -222,7 +307,7 @@ def main():
 
     # [新增] density_map 开关
     # 在 parser 参数定义区添加
-    parser.add_argument("--density_map", type=str, default=None, help="Path to pre-calculated token density JSON for DenPAD")
+    parser.add_argument("--density_map", type=str, default=None, help="Legacy decoder-side DenPAD density map path.")
     
     # Noise type configuration
     parser.add_argument(
@@ -249,6 +334,25 @@ def main():
     )
 
     parser.add_argument("--lprag_epsilon", type=float, default=3.0, help="Privacy budget for LPRAG.")
+    parser.add_argument("--denpad_density_backend", type=str, default="word2vec-google-news-300", help="Public embedding backend for DenPAD-L density scoring.")
+    parser.add_argument("--denpad_density_k", type=int, default=20, help="Neighborhood size for DenPAD-L density scoring.")
+    parser.add_argument("--denpad_candidate_topk", type=int, default=20, help="Candidate pool size for DenPAD-L mechanisms.")
+    parser.add_argument("--denpad_candidate_min_score", type=float, default=0.25, help="Minimum utility score retained for typed DenPAD candidates.")
+    parser.add_argument("--denpad_lambda_smooth", type=float, default=0.1, help="Smoothing term for DenPAD-L budget allocation.")
+    parser.add_argument("--denpad_min_epsilon", type=float, default=0.05, help="Minimum per-entity epsilon for DenPAD-L.")
+    parser.add_argument("--denpad_resources_dir", type=str, default="resources", help="Directory containing public resource JSON files for DenPAD-L.")
+    parser.add_argument("--denpad_local_ner_backend", type=str, default=None, help="Optional local biomedical NER/type model for retrieval-time DenPAD.")
+    parser.add_argument("--disable_denpad_medical_ner", action="store_true", help="Disable local medical type enhancement in retrieval-time DenPAD.")
+    parser.add_argument("--denpad_audit_file", type=str, default=None, help="Optional JSONL path for DenPAD-L perturbation audit records.")
+    parser.add_argument("--debug_corpus_limit", type=int, default=None, help="Optional limit on corpus documents/chunks for fast debugging.")
+    parser.add_argument("--debug_prompt_limit", type=int, default=None, help="Optional limit on evaluation prompts for fast debugging.")
+    parser.add_argument("--retrieval_k", type=int, default=6, help="Number of retrieved chunks before reranking.")
+    parser.add_argument("--rerank_top_n", type=int, default=3, help="Number of chunks kept after reranking or truncation.")
+    parser.add_argument(
+        "--disable_reranker",
+        action="store_true",
+        help="Disable cross-encoder reranking to speed up Track A experiments.",
+    )
     
     # Corpus preprocessing options
     parser.add_argument(
@@ -276,15 +380,28 @@ def main():
         logging.info(f"Device: {args.device}")
         
         # Log privacy configuration
-        if args.method in {"pad", "denpad"}:
+        if args.method == "pad":
             if args.method == "pad" and args.noise_type == "static":
                 logging.info(f"Static Baseline DP: ε={args.epsilon} | δ={args.delta} | noise_scale={args.static_noise_scale}")
             else:
                 logging.info(f"Decoding DP: ε={args.epsilon} | δ={args.delta}")
                 logging.info(f"Features: screening={not args.disable_screening}, calibration={not args.disable_calibration}")
                 logging.info(f"Enhancement: amplification={args.noise_amplification}, min_sensitivity={args.min_sensitivity}")
-                if args.method == "denpad" and args.density_map:
-                    logging.info(f"DenPAD density map: {args.density_map}")
+        elif args.method == "denpad":
+            logging.info("DenPAD-RT retrieval-time sanitization: epsilon_query=%s", args.epsilon)
+            logging.info(
+                "DenPAD-RT density backend=%s, k=%s, candidate_topk=%s",
+                args.denpad_density_backend,
+                args.denpad_density_k,
+                args.denpad_candidate_topk,
+            )
+            logging.info(
+                "DenPAD-RT resources dir=%s, medical_ner=%s, local_ner_backend=%s, candidate_min_score=%s",
+                args.denpad_resources_dir,
+                not args.disable_denpad_medical_ner,
+                args.denpad_local_ner_backend or "auto",
+                args.denpad_candidate_min_score,
+            )
         elif args.method == "lprag":
             logging.info(f"LPRAG entity perturbation: ε={args.lprag_epsilon}")
         else:
@@ -297,6 +414,7 @@ def main():
             args.max_tokens,
             args.repetition_penalty,
         )
+        logging.info("Decoding mode: %s", "greedy/deterministic" if args.disable_sampling else "sampling")
     else:
         print(f"Running {args.method} on {args.dataset}")
 
@@ -378,6 +496,9 @@ def main():
         logging.info(f"Loading test prompts from {prompt_file}")
         with open(prompt_file, "r", encoding="utf-8") as f:
             prompts = json.load(f)
+        if args.debug_prompt_limit is not None:
+            prompts = prompts[: args.debug_prompt_limit]
+            logging.info("Debug prompt limit enabled: using first %s prompts", len(prompts))
         logging.info(f"Loaded {len(prompts)} test prompts from {prompt_file}")
     else:
         logging.error(f"Prompt file {prompt_file} not found.")
@@ -402,6 +523,9 @@ def main():
         
         # No further splitting needed for email bodies
         split_docs = documents
+        if args.debug_corpus_limit is not None:
+            split_docs = split_docs[: args.debug_corpus_limit]
+            logging.info("Debug corpus limit enabled: using first %s email documents", len(split_docs))
         
         # Build retrieval database
         builder = RetrievalDatabaseBuilder(device=args.device)
@@ -424,6 +548,9 @@ def main():
         # Split documents into chunks for better retrieval
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
         split_docs = splitter.split_documents(documents)
+        if args.debug_corpus_limit is not None:
+            split_docs = split_docs[: args.debug_corpus_limit]
+            logging.info("Debug corpus limit enabled: using first %s corpus chunks", len(split_docs))
 
         # Build retrieval database
         builder = RetrievalDatabaseBuilder(device=args.device)
@@ -447,7 +574,7 @@ def main():
 
     # === Step 3: Initialize Language Model ===
     model_name = args.model_name
-    tokenizer, model = setup_tokenizer_model(model_name, args.device)
+    tokenizer, model = setup_tokenizer_model(model_name, args.device, args.torch_dtype)
 
     # Initialize LLM with privacy mechanisms
     # 在初始化 LLMEngine 处
@@ -461,9 +588,8 @@ def main():
         enable_screening=not args.disable_screening,
         enable_calibration=not args.disable_calibration,
         
-        # [新增] DenPAD 参数
+        # Legacy decoder-side DenPAD parameter path kept for backward compatibility.
         density_map_path=args.density_map,
-        # 新增消融开关
         ablation_mode=args.ablation_mode,
         
         noise_amplification=args.noise_amplification,
@@ -474,10 +600,29 @@ def main():
     )
 
     # === Step 4: Initialize RAG Pipeline ===
+    context_sanitizer = None
+    if args.method == "denpad":
+        from denpad_core import DenPADSanitizer
+
+        context_sanitizer = DenPADSanitizer(
+            epsilon_doc=args.epsilon,
+            density_backend=args.denpad_density_backend,
+            density_k=args.denpad_density_k,
+            candidate_topk=args.denpad_candidate_topk,
+            lambda_smooth=args.denpad_lambda_smooth,
+            min_epsilon=args.denpad_min_epsilon,
+            resources_dir=args.denpad_resources_dir,
+            medical_ner_backend=args.denpad_local_ner_backend,
+            enable_medical_ner=not args.disable_denpad_medical_ner,
+            min_candidate_score=args.denpad_candidate_min_score,
+        )
+
     rag = RAGPipeline(
         retriever=db, 
         llm=llm, 
-        device=args.device
+        device=args.device,
+        use_reranker=not args.disable_reranker,
+        context_sanitizer=context_sanitizer,
     )
 
     # === Step 5: Execute RAG Pipeline and Generate Responses ===
@@ -487,6 +632,12 @@ def main():
     else:
         output_file = os.path.join(out_dir, "rag_results.json")
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    if args.method == "denpad" and args.denpad_audit_file:
+        audit_dir = os.path.dirname(args.denpad_audit_file)
+        if audit_dir:
+            os.makedirs(audit_dir, exist_ok=True)
+        with open(args.denpad_audit_file, "w", encoding="utf-8") as f:
+            f.write("")
 
     # Process each test prompt
     for i, prompt in enumerate(tqdm(prompts, desc="Generating RAG responses")):
@@ -500,14 +651,18 @@ def main():
             # ==========================================
 
             # Generate response using RAG pipeline
+            sample_start = time.perf_counter()
             result = rag.run(
                 prompt,
+                k=args.retrieval_k,
+                top_n=args.rerank_top_n,
                 top_p=args.top_p,
                 max_new_tokens=args.max_tokens,
                 temperature=args.temperature,
-                do_sample=True,
+                do_sample=not args.disable_sampling,
                 repetition_penalty=args.repetition_penalty,
             )
+            result["total_runtime_sec"] = time.perf_counter() - sample_start
             
             # Track privacy loss if noise injection is enabled
             epsilon_dp = llm.get_total_privacy_loss()
@@ -572,6 +727,16 @@ def main():
             
             result["ground_truth"] = ground_truth
             # ==============================================================
+
+            if args.method == "denpad" and args.denpad_audit_file and result.get("denpad_audit"):
+                with open(args.denpad_audit_file, "a", encoding="utf-8") as f:
+                    for record in result["denpad_audit"]:
+                        record_with_query = {
+                            "prompt_index": i,
+                            "source_question": prompt,
+                            **record,
+                        }
+                        f.write(json.dumps(record_with_query, ensure_ascii=False) + "\n")
 
         except Exception as e:
             # Handle errors gracefully

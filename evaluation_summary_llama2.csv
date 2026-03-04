@@ -1,4 +1,4 @@
-Dataset,Method,Repeat_Prompts,Repeat_Contexts,Rouge_Prompts,Rouge_Contexts,PPL
+Dataset,Method,Repeat_Prompts,Repeat_Contexts,Rouge_Prompts,Rouge_Contexts,PPL(Avg Perplexity)
 healthcaremagic,baseline_attack,33,31,66,62,7.40
 healthcaremagic,pad_attack,40,43,75,81,7.83
 healthcaremagic,lprag_attack,29,33,60,67,7.83

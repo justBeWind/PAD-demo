@@ -1,0 +1,79 @@
+{
+  "items": [
+    {
+      "term": "sertraline",
+      "aliases": ["zoloft"],
+      "related": ["fluoxetine", "escitalopram"],
+      "generalized": ["antidepressant medication", "psychiatric medication"],
+      "tags": ["ssri", "psychiatric"]
+    },
+    {
+      "term": "pazopanib",
+      "aliases": ["votrient"],
+      "related": ["sunitinib", "sorafenib"],
+      "generalized": ["targeted cancer therapy", "oncology medication"],
+      "tags": ["oncology", "tki"]
+    },
+    {
+      "term": "amoxicillin",
+      "aliases": ["amoxxicilin", "amoxycillin"],
+      "related": ["azithromycin", "doxycycline"],
+      "generalized": ["antibiotic medication", "infection treatment"],
+      "tags": ["antibiotic"]
+    },
+    {
+      "term": "clotrimazole",
+      "related": ["miconazole", "eurax"],
+      "generalized": ["antifungal medication", "skin treatment"],
+      "tags": ["antifungal", "dermatology"]
+    },
+    {
+      "term": "metformin",
+      "related": ["glipizide", "glyburide", "pioglitazone"],
+      "generalized": ["diabetes medication", "blood sugar medication"],
+      "tags": ["antidiabetic", "endocrine"]
+    },
+    {
+      "term": "acetaminophen",
+      "aliases": ["paracetamol"],
+      "related": ["ibuprofen", "aspirin"],
+      "tags": ["analgesic", "pain"]
+    },
+    {
+      "term": "prednisone",
+      "related": ["methylprednisolone", "prednisolone"],
+      "generalized": ["steroid medication", "anti inflammatory medication"],
+      "tags": ["steroid", "anti-inflammatory"]
+    },
+    {
+      "term": "pregabalin",
+      "aliases": ["lyrica"],
+      "related": ["gabapentin"],
+      "generalized": ["nerve pain medication", "neurological medication"],
+      "tags": ["neurology", "pain"]
+    },
+    {
+      "term": "oxcarbazepine",
+      "aliases": ["trileptal"],
+      "related": ["carbamazepine"],
+      "generalized": ["antiepileptic medication", "neurological medication"],
+      "tags": ["neurology", "antiepileptic"]
+    },
+    {
+      "term": "levothyroxine",
+      "aliases": ["euthyrox"],
+      "related": ["thyroxine"],
+      "generalized": ["thyroid medication", "hormone replacement therapy"],
+      "tags": ["endocrine", "thyroid"]
+    },
+    "ibuprofen",
+    "aspirin",
+    "fluoxetine",
+    "escitalopram",
+    "sunitinib",
+    "sorafenib",
+    "azithromycin",
+    "doxycycline",
+    "miconazole"
+  ]
+}

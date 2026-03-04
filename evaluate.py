@@ -1,13 +1,45 @@
 import json
 import argparse
 import re
+import os
 from rouge_score import rouge_scorer
 from nltk.tokenize import RegexpTokenizer
+
+
+def _configure_runtime_threads() -> int:
+    """Set a safe automatic thread count for BLAS/OpenMP backends."""
+    cpu_count = os.cpu_count() or 1
+    auto_threads = max(1, min(8, cpu_count // 4 if cpu_count >= 8 else cpu_count))
+
+    def _parse_positive_int(name: str) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    resolved = _parse_positive_int("OMP_NUM_THREADS")
+    if resolved is None:
+        resolved = auto_threads
+
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        if _parse_positive_int(name) is None:
+            os.environ[name] = str(resolved)
+
+    return resolved
+
+
+RUNTIME_THREADS = _configure_runtime_threads()
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import numpy as np
 import logging
-import os
+
+torch.set_num_threads(RUNTIME_THREADS)
 
 # --- 可选依赖项检查 ---
 try:

@@ -1,0 +1,158 @@
+{
+  "items": [
+    {
+      "term": "alopecia areata",
+      "aliases": ["alopecia"],
+      "related": ["androgenetic alopecia", "hair loss disorder"],
+      "generalized": ["hair loss condition", "autoimmune hair disorder"],
+      "tags": ["dermatology", "hair"]
+    },
+    {
+      "term": "carpal tunnel syndrome",
+      "related": ["peripheral neuropathy", "wrist neuropathy"],
+      "tags": ["neurology", "orthopedic"]
+    },
+    {
+      "term": "interstitial lung disease",
+      "aliases": ["ild", "ild-interstitial lung", "interstitial lung"],
+      "related": ["pulmonary fibrosis", "chronic lung disease", "interstitial pneumonia"],
+      "tags": ["pulmonary", "respiratory"]
+    },
+    {
+      "term": "helicobacter pylori infection",
+      "aliases": ["h pylori", "hpylori"],
+      "related": ["gastritis", "peptic ulcer disease"],
+      "generalized": ["stomach infection", "gastrointestinal infection"],
+      "tags": ["gastrointestinal"]
+    },
+    {
+      "term": "graves disease",
+      "aliases": ["graves disease hyperthyroid", "hyperthyroidism", "hyperthyroid"],
+      "related": ["thyroid disorder", "autoimmune thyroid disease"],
+      "generalized": ["thyroid disorder", "endocrine disorder"],
+      "tags": ["endocrine", "thyroid"]
+    },
+    {
+      "term": "addison disease",
+      "aliases": ["the addison s", "addison's disease", "addisons disease"],
+      "related": ["adrenal insufficiency"],
+      "generalized": ["adrenal disorder", "endocrine disorder"],
+      "tags": ["endocrine", "adrenal"]
+    },
+    {
+      "term": "aplastic anemia",
+      "aliases": ["severe aplastic anemia"],
+      "related": ["hemolytic anemia", "iron deficiency anemia"],
+      "tags": ["hematology"]
+    },
+    {
+      "term": "jaundice",
+      "related": ["neonatal jaundice", "hepatitis", "liver disease"],
+      "generalized": ["liver condition", "hepatic disorder"],
+      "tags": ["hepatic", "gastrointestinal"]
+    },
+    {
+      "term": "psoriasis",
+      "related": ["eczema", "dermatitis"],
+      "generalized": ["skin condition", "inflammatory skin disorder"],
+      "tags": ["dermatology"]
+    },
+    {
+      "term": "asthma",
+      "related": ["bronchitis", "reactive airway disease"],
+      "tags": ["pulmonary", "respiratory"]
+    },
+    {
+      "term": "androgenetic alopecia",
+      "aliases": ["male pattern hair loss", "female pattern hair loss"],
+      "related": ["alopecia areata", "hair loss disorder"],
+      "generalized": ["hair loss condition", "scalp condition"],
+      "tags": ["dermatology", "hair"]
+    },
+    {
+      "term": "diabetes",
+      "related": ["type 2 diabetes", "prediabetes"],
+      "tags": ["endocrine", "metabolic"]
+    },
+    {
+      "term": "migraine",
+      "related": ["tension headache", "cluster headache"],
+      "tags": ["neurology", "pain"]
+    },
+    {
+      "term": "cancer",
+      "related": ["lung cancer", "breast cancer", "colon cancer"],
+      "tags": ["oncology"]
+    },
+    {
+      "term": "hypertension",
+      "related": ["high blood pressure", "essential hypertension"],
+      "tags": ["cardiovascular"]
+    },
+    {
+      "term": "arthritis",
+      "related": ["osteoarthritis", "rheumatoid arthritis"],
+      "tags": ["rheumatology", "pain"]
+    },
+    {
+      "term": "anxiety",
+      "related": ["generalized anxiety disorder"],
+      "generalized": ["mental health condition", "anxiety disorder"],
+      "tags": ["psychiatric"]
+    },
+    {
+      "term": "gonorrhea",
+      "related": ["sexually transmitted infection", "bacterial infection"],
+      "generalized": ["sexually transmitted infection", "bacterial infection"],
+      "tags": ["infectious", "sexual_health"]
+    },
+    {
+      "term": "trigeminal neuralgia",
+      "related": ["facial neuralgia", "neuropathic facial pain"],
+      "generalized": ["nerve pain condition", "neurological pain disorder"],
+      "tags": ["neurology", "pain"]
+    },
+    {
+      "term": "deep vein thrombosis",
+      "aliases": ["dvt"],
+      "related": ["venous thrombosis", "blood clot disorder"],
+      "generalized": ["vascular condition", "circulatory disorder"],
+      "tags": ["vascular", "hematology"]
+    },
+    {
+      "term": "thyroid cancer",
+      "related": ["thyroid carcinoma", "thyroid malignancy"],
+      "generalized": ["thyroid disorder", "cancer condition"],
+      "tags": ["thyroid", "oncology"]
+    },
+    {
+      "term": "brain aneurysm",
+      "related": ["cerebral aneurysm", "intracranial aneurysm"],
+      "generalized": ["vascular condition", "neurological condition"],
+      "tags": ["neurology", "vascular"]
+    },
+    {
+      "term": "depression",
+      "related": ["major depressive disorder", "mood disorder"],
+      "tags": ["psychiatric"]
+    },
+    {
+      "term": "sinusitis",
+      "related": ["rhinosinusitis"],
+      "tags": ["ent"]
+    },
+    "dermatitis",
+    "gonorrhea",
+    "eczema",
+    "gastritis",
+    "hepatitis",
+    "pulmonary fibrosis",
+    "peptic ulcer disease",
+    "heart disease",
+    "kidney disease",
+    "liver disease",
+    "metabolic syndrome",
+    "neonatal jaundice",
+    "hemolytic anemia"
+  ]
+}

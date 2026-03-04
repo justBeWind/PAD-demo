@@ -1,0 +1,524 @@
+{
+  "items": [
+    {
+      "term": "alopecia areata",
+      "aliases": [
+        "alopecia"
+      ],
+      "related": [
+        "androgenetic alopecia",
+        "hair loss disorder"
+      ],
+      "generalized": [
+        "hair loss condition",
+        "autoimmune hair disorder"
+      ],
+      "tags": [
+        "dermatology",
+        "hair"
+      ],
+      "canonical_id": "disease:alopecia_areata"
+    },
+    {
+      "term": "carpal tunnel syndrome",
+      "aliases": [],
+      "related": [
+        "peripheral neuropathy",
+        "wrist neuropathy"
+      ],
+      "generalized": [
+        "neurological condition"
+      ],
+      "tags": [
+        "neurology",
+        "orthopedic"
+      ],
+      "canonical_id": "disease:carpal_tunnel_syndrome"
+    },
+    {
+      "term": "interstitial lung disease",
+      "aliases": [
+        "ild",
+        "ild-interstitial lung",
+        "interstitial lung"
+      ],
+      "related": [
+        "pulmonary fibrosis",
+        "chronic lung disease",
+        "interstitial pneumonia"
+      ],
+      "generalized": [
+        "respiratory condition"
+      ],
+      "tags": [
+        "pulmonary",
+        "respiratory"
+      ],
+      "canonical_id": "disease:interstitial_lung_disease"
+    },
+    {
+      "term": "helicobacter pylori infection",
+      "aliases": [
+        "h pylori",
+        "hpylori"
+      ],
+      "related": [
+        "gastritis",
+        "peptic ulcer disease"
+      ],
+      "generalized": [
+        "stomach infection",
+        "gastrointestinal infection"
+      ],
+      "tags": [
+        "gastrointestinal"
+      ],
+      "canonical_id": "disease:helicobacter_pylori_infection"
+    },
+    {
+      "term": "graves disease",
+      "aliases": [
+        "graves disease hyperthyroid",
+        "hyperthyroidism",
+        "hyperthyroid"
+      ],
+      "related": [
+        "thyroid disorder",
+        "autoimmune thyroid disease"
+      ],
+      "generalized": [
+        "thyroid disorder",
+        "endocrine disorder"
+      ],
+      "tags": [
+        "endocrine",
+        "thyroid"
+      ],
+      "canonical_id": "disease:graves_disease"
+    },
+    {
+      "term": "addison disease",
+      "aliases": [
+        "the addison s",
+        "addison's disease",
+        "addisons disease"
+      ],
+      "related": [
+        "adrenal insufficiency"
+      ],
+      "generalized": [
+        "adrenal disorder",
+        "endocrine disorder"
+      ],
+      "tags": [
+        "endocrine",
+        "adrenal"
+      ],
+      "canonical_id": "disease:addison_disease"
+    },
+    {
+      "term": "aplastic anemia",
+      "aliases": [
+        "severe aplastic anemia"
+      ],
+      "related": [
+        "hemolytic anemia",
+        "iron deficiency anemia"
+      ],
+      "generalized": [
+        "blood disorder"
+      ],
+      "tags": [
+        "hematology"
+      ],
+      "canonical_id": "disease:aplastic_anemia"
+    },
+    {
+      "term": "jaundice",
+      "aliases": [],
+      "related": [
+        "neonatal jaundice",
+        "hepatitis",
+        "liver disease"
+      ],
+      "generalized": [
+        "liver condition",
+        "hepatic disorder"
+      ],
+      "tags": [
+        "hepatic",
+        "gastrointestinal"
+      ],
+      "canonical_id": "disease:jaundice"
+    },
+    {
+      "term": "psoriasis",
+      "aliases": [],
+      "related": [
+        "eczema",
+        "dermatitis"
+      ],
+      "generalized": [
+        "skin condition",
+        "inflammatory skin disorder"
+      ],
+      "tags": [
+        "dermatology"
+      ],
+      "canonical_id": "disease:psoriasis"
+    },
+    {
+      "term": "asthma",
+      "aliases": [],
+      "related": [
+        "bronchitis",
+        "reactive airway disease"
+      ],
+      "generalized": [
+        "respiratory condition"
+      ],
+      "tags": [
+        "pulmonary",
+        "respiratory"
+      ],
+      "canonical_id": "disease:asthma"
+    },
+    {
+      "term": "androgenetic alopecia",
+      "aliases": [
+        "male pattern hair loss",
+        "female pattern hair loss"
+      ],
+      "related": [
+        "alopecia areata",
+        "hair loss disorder"
+      ],
+      "generalized": [
+        "hair loss condition",
+        "scalp condition"
+      ],
+      "tags": [
+        "dermatology",
+        "hair"
+      ],
+      "canonical_id": "disease:androgenetic_alopecia"
+    },
+    {
+      "term": "diabetes",
+      "aliases": [],
+      "related": [
+        "type 2 diabetes",
+        "prediabetes"
+      ],
+      "generalized": [
+        "endocrine disorder"
+      ],
+      "tags": [
+        "endocrine",
+        "metabolic"
+      ],
+      "canonical_id": "disease:diabetes"
+    },
+    {
+      "term": "migraine",
+      "aliases": [],
+      "related": [
+        "tension headache",
+        "cluster headache"
+      ],
+      "generalized": [
+        "neurological condition",
+        "pain disorder"
+      ],
+      "tags": [
+        "neurology",
+        "pain"
+      ],
+      "canonical_id": "disease:migraine"
+    },
+    {
+      "term": "cancer",
+      "aliases": [],
+      "related": [
+        "lung cancer",
+        "breast cancer",
+        "colon cancer"
+      ],
+      "generalized": [
+        "cancer condition"
+      ],
+      "tags": [
+        "oncology"
+      ],
+      "canonical_id": "disease:cancer"
+    },
+    {
+      "term": "hypertension",
+      "aliases": [],
+      "related": [
+        "high blood pressure",
+        "essential hypertension"
+      ],
+      "generalized": [],
+      "tags": [
+        "cardiovascular"
+      ],
+      "canonical_id": "disease:hypertension"
+    },
+    {
+      "term": "arthritis",
+      "aliases": [],
+      "related": [
+        "osteoarthritis",
+        "rheumatoid arthritis"
+      ],
+      "generalized": [
+        "pain disorder",
+        "joint condition"
+      ],
+      "tags": [
+        "rheumatology",
+        "pain"
+      ],
+      "canonical_id": "disease:arthritis"
+    },
+    {
+      "term": "anxiety",
+      "aliases": [],
+      "related": [
+        "generalized anxiety disorder"
+      ],
+      "generalized": [
+        "mental health condition",
+        "anxiety disorder"
+      ],
+      "tags": [
+        "psychiatric"
+      ],
+      "canonical_id": "disease:anxiety"
+    },
+    {
+      "term": "gonorrhea",
+      "aliases": [],
+      "related": [
+        "sexually transmitted infection",
+        "bacterial infection"
+      ],
+      "generalized": [
+        "sexually transmitted infection",
+        "bacterial infection"
+      ],
+      "tags": [
+        "infectious",
+        "sexual_health"
+      ],
+      "canonical_id": "disease:gonorrhea"
+    },
+    {
+      "term": "trigeminal neuralgia",
+      "aliases": [],
+      "related": [
+        "facial neuralgia",
+        "neuropathic facial pain"
+      ],
+      "generalized": [
+        "nerve pain condition",
+        "neurological pain disorder"
+      ],
+      "tags": [
+        "neurology",
+        "pain"
+      ],
+      "canonical_id": "disease:trigeminal_neuralgia"
+    },
+    {
+      "term": "deep vein thrombosis",
+      "aliases": [
+        "dvt"
+      ],
+      "related": [
+        "venous thrombosis",
+        "blood clot disorder"
+      ],
+      "generalized": [
+        "vascular condition",
+        "circulatory disorder"
+      ],
+      "tags": [
+        "vascular",
+        "hematology"
+      ],
+      "canonical_id": "disease:deep_vein_thrombosis"
+    },
+    {
+      "term": "thyroid cancer",
+      "aliases": [],
+      "related": [
+        "thyroid carcinoma",
+        "thyroid malignancy"
+      ],
+      "generalized": [
+        "thyroid disorder",
+        "cancer condition"
+      ],
+      "tags": [
+        "thyroid",
+        "oncology"
+      ],
+      "canonical_id": "disease:thyroid_cancer"
+    },
+    {
+      "term": "brain aneurysm",
+      "aliases": [],
+      "related": [
+        "cerebral aneurysm",
+        "intracranial aneurysm"
+      ],
+      "generalized": [
+        "vascular condition",
+        "neurological condition"
+      ],
+      "tags": [
+        "neurology",
+        "vascular"
+      ],
+      "canonical_id": "disease:brain_aneurysm"
+    },
+    {
+      "term": "depression",
+      "aliases": [],
+      "related": [
+        "major depressive disorder",
+        "mood disorder"
+      ],
+      "generalized": [
+        "mental health condition"
+      ],
+      "tags": [
+        "psychiatric"
+      ],
+      "canonical_id": "disease:depression"
+    },
+    {
+      "term": "sinusitis",
+      "aliases": [],
+      "related": [
+        "rhinosinusitis"
+      ],
+      "generalized": [],
+      "tags": [
+        "ent"
+      ],
+      "canonical_id": "disease:sinusitis"
+    },
+    {
+      "term": "dermatitis",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:dermatitis"
+    },
+    {
+      "term": "gonorrhea",
+      "aliases": [],
+      "related": [],
+      "generalized": [
+        "sexually transmitted infection",
+        "bacterial infection"
+      ],
+      "tags": [],
+      "canonical_id": "disease:gonorrhea"
+    },
+    {
+      "term": "eczema",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:eczema"
+    },
+    {
+      "term": "gastritis",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:gastritis"
+    },
+    {
+      "term": "hepatitis",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:hepatitis"
+    },
+    {
+      "term": "pulmonary fibrosis",
+      "aliases": [],
+      "related": [],
+      "generalized": [
+        "respiratory condition"
+      ],
+      "tags": [],
+      "canonical_id": "disease:pulmonary_fibrosis"
+    },
+    {
+      "term": "peptic ulcer disease",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:peptic_ulcer_disease"
+    },
+    {
+      "term": "heart disease",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:heart_disease"
+    },
+    {
+      "term": "kidney disease",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:kidney_disease"
+    },
+    {
+      "term": "liver disease",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:liver_disease"
+    },
+    {
+      "term": "metabolic syndrome",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:metabolic_syndrome"
+    },
+    {
+      "term": "neonatal jaundice",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:neonatal_jaundice"
+    },
+    {
+      "term": "hemolytic anemia",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "disease:hemolytic_anemia"
+    }
+  ]
+}

@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import time
 
 import numpy as np
 import torch
@@ -443,7 +444,7 @@ class LLMEngine:
         self.noise_type = noise_type
         self.verbose = verbose
 
-        if method == "baseline" or method == "lprag":
+        if method == "baseline" or method == "lprag" or method == "denpad":
             self.noise_processor = None
         elif method == "pad":
             if noise_type == "static":
@@ -463,20 +464,6 @@ class LLMEngine:
                     noise_amplification=noise_amplification,
                     min_sensitivity=min_sensitivity,
                 )
-        elif method == "denpad":
-            self.noise_processor = DenPADAdaptiveNoiseProcessor(
-                epsilon_base=epsilon,
-                alpha=alpha,
-                delta=delta,
-                enable_screening=enable_screening,
-                enable_calibration=enable_calibration,
-                density_map_path=density_map_path,
-                ablation_mode=ablation_mode,
-                noise_amplification=noise_amplification,
-                min_sensitivity=min_sensitivity,
-                tokenizer=tokenizer,
-                dataset_name=dataset,
-            )
         else:
             raise ValueError(f"Unsupported method: {method}")
 
@@ -544,15 +531,29 @@ class LLMEngine:
 
 
 class RAGPipeline:
-    def __init__(self, retriever, llm, reranker_model="BAAI/bge-reranker-large", device="auto"):
+    def __init__(
+        self,
+        retriever,
+        llm,
+        reranker_model="BAAI/bge-reranker-large",
+        device="auto",
+        use_reranker=True,
+        context_sanitizer=None,
+    ):
         self.retriever = retriever
         self.llm = llm
-        reranker_device = "cuda" if torch.cuda.is_available() and device == "auto" else "cpu"
-        self.reranker = CrossEncoder(reranker_model, device=reranker_device)
+        self.use_reranker = use_reranker
+        self.context_sanitizer = context_sanitizer
+        self.reranker = None
+        if self.use_reranker:
+            reranker_device = "cuda" if torch.cuda.is_available() and device == "auto" else "cpu"
+            self.reranker = CrossEncoder(reranker_model, device=reranker_device)
 
     def rerank_contexts(self, question, docs, top_n=3):
         if not docs:
             return []
+        if not self.use_reranker or self.reranker is None:
+            return docs[:top_n]
         pairs = [[question, d.page_content] for d in docs]
         scores = self.reranker.predict(pairs, show_progress_bar=False)
         doc_scores = list(zip(docs, scores))
@@ -560,17 +561,48 @@ class RAGPipeline:
         return [doc for doc, _ in doc_scores[:top_n]]
 
     def run(self, question, k=6, top_n=3, **kwargs):
+        retrieval_start = time.perf_counter()
         docs = self.retriever.similarity_search(question, k=k)
-        top_docs = self.rerank_contexts(question, docs, top_n=top_n)
-        context = "\n\n".join(d.page_content for d in top_docs)
-        prompt = f"[INST] Use the following context to answer the question.\n\nContext:\n{context}\n\nQuestion: {question} [/INST]"
+        retrieval_time = time.perf_counter() - retrieval_start
 
-        return {
+        rerank_start = time.perf_counter()
+        top_docs = self.rerank_contexts(question, docs, top_n=top_n)
+        rerank_time = time.perf_counter() - rerank_start
+
+        original_docs = [d.page_content for d in top_docs]
+        sanitized_docs = original_docs
+        sanitization_metadata = None
+        sanitization_time = 0.0
+        if self.context_sanitizer is not None:
+            sanitization_start = time.perf_counter()
+            sanitized_docs, sanitization_metadata = self.context_sanitizer.sanitize_retrieved_docs(
+                original_docs,
+                query=question,
+            )
+            sanitization_time = time.perf_counter() - sanitization_start
+
+        context_original = "\n\n".join(original_docs)
+        context = "\n\n".join(sanitized_docs)
+        prompt = f"[INST] Use the following context to answer the question.\n\nContext:\n{context}\n\nQuestion: {question} [/INST]"
+        generation_start = time.perf_counter()
+        answer = self.llm.generate(prompt, **kwargs)
+        generation_time = time.perf_counter() - generation_start
+
+        result = {
             "question": question,
             "context": context,
-            "answer": self.llm.generate(prompt, **kwargs),
-            "retrieved_docs": [d.page_content for d in top_docs],
-            "retrieved_docs_original": [
-                d.metadata.get("original_page_content", d.page_content) for d in top_docs
-            ],
+            "context_original": context_original,
+            "answer": answer,
+            "retrieved_docs": sanitized_docs,
+            "retrieved_docs_original": original_docs,
+            "retrieval_time_sec": retrieval_time,
+            "rerank_time_sec": rerank_time,
+            "sanitization_time_sec": sanitization_time,
+            "generation_time_sec": generation_time,
         }
+        if sanitization_metadata is not None:
+            result["denpad_query_epsilon"] = sanitization_metadata.get("epsilon_query", sanitization_metadata.get("epsilon_doc"))
+            result["denpad_num_entities"] = sanitization_metadata.get("num_entities", 0)
+            result["denpad_num_perturbed"] = sanitization_metadata.get("num_perturbed", 0)
+            result["denpad_audit"] = sanitization_metadata.get("audit_records", [])
+        return result
