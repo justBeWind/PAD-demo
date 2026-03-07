@@ -1,42 +1,57 @@
 {
+  "schema_version": "typed_resource_v1",
+  "metadata": {
+    "resource_type": "DRUG",
+    "builder_version": "1.0.0",
+    "generated_at_utc": "2026-03-05T06:23:58.166170+00:00",
+    "source_path": "/root/autodl-tmp/PAD-demo/resources/drug_terms.json",
+    "source_sha256": "e528a0178d9b3caa58fc6d5173ffd894f703c7c2ada58be235e3991b46cd089e",
+    "source_item_count": 19,
+    "record_count": 19,
+    "source_metadata": {
+      "name": "unspecified",
+      "url": "",
+      "license": "",
+      "version": ""
+    },
+    "build_stats": {
+      "raw_items": 19,
+      "dropped_empty": 0,
+      "normalized_records": 19,
+      "duplicates_merged": 0,
+      "generalized_generated": 6,
+      "related_filled": 0
+    },
+    "normalization_policy": {
+      "whitespace_normalization": true,
+      "dedupe_case_insensitive": true,
+      "ascii_slug_canonical_ids": true
+    },
+    "related_builder": {
+      "top_k": 3,
+      "min_score": 0.18,
+      "lexical_weight": 0.35,
+      "tag_overlap_weight": 0.65
+    }
+  },
   "items": [
     {
-      "term": "sertraline",
+      "term": "acetaminophen",
       "aliases": [
-        "zoloft"
+        "paracetamol"
       ],
       "related": [
-        "fluoxetine",
-        "escitalopram"
+        "ibuprofen",
+        "aspirin"
       ],
       "generalized": [
-        "antidepressant medication",
-        "psychiatric medication"
+        "pain medication"
       ],
       "tags": [
-        "ssri",
-        "psychiatric"
+        "analgesic",
+        "pain"
       ],
-      "canonical_id": "drug:sertraline"
-    },
-    {
-      "term": "pazopanib",
-      "aliases": [
-        "votrient"
-      ],
-      "related": [
-        "sunitinib",
-        "sorafenib"
-      ],
-      "generalized": [
-        "targeted cancer therapy",
-        "oncology medication"
-      ],
-      "tags": [
-        "oncology",
-        "tki"
-      ],
-      "canonical_id": "drug:pazopanib"
+      "canonical_id": "drug:acetaminophen"
     },
     {
       "term": "amoxicillin",
@@ -58,6 +73,25 @@
       "canonical_id": "drug:amoxicillin"
     },
     {
+      "term": "aspirin",
+      "aliases": [],
+      "related": [],
+      "generalized": [
+        "pain medication",
+        "anti inflammatory medication"
+      ],
+      "tags": [],
+      "canonical_id": "drug:aspirin"
+    },
+    {
+      "term": "azithromycin",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "drug:azithromycin"
+    },
+    {
       "term": "clotrimazole",
       "aliases": [],
       "related": [
@@ -73,6 +107,65 @@
         "dermatology"
       ],
       "canonical_id": "drug:clotrimazole"
+    },
+    {
+      "term": "doxycycline",
+      "aliases": [],
+      "related": [],
+      "generalized": [],
+      "tags": [],
+      "canonical_id": "drug:doxycycline"
+    },
+    {
+      "term": "escitalopram",
+      "aliases": [],
+      "related": [],
+      "generalized": [
+        "antidepressant medication",
+        "psychiatric medication"
+      ],
+      "tags": [],
+      "canonical_id": "drug:escitalopram"
+    },
+    {
+      "term": "fluoxetine",
+      "aliases": [],
+      "related": [],
+      "generalized": [
+        "antidepressant medication",
+        "psychiatric medication"
+      ],
+      "tags": [],
+      "canonical_id": "drug:fluoxetine"
+    },
+    {
+      "term": "ibuprofen",
+      "aliases": [],
+      "related": [],
+      "generalized": [
+        "pain medication",
+        "anti inflammatory medication"
+      ],
+      "tags": [],
+      "canonical_id": "drug:ibuprofen"
+    },
+    {
+      "term": "levothyroxine",
+      "aliases": [
+        "euthyrox"
+      ],
+      "related": [
+        "thyroxine"
+      ],
+      "generalized": [
+        "thyroid medication",
+        "hormone replacement therapy"
+      ],
+      "tags": [
+        "endocrine",
+        "thyroid"
+      ],
+      "canonical_id": "drug:levothyroxine"
     },
     {
       "term": "metformin",
@@ -93,22 +186,51 @@
       "canonical_id": "drug:metformin"
     },
     {
-      "term": "acetaminophen",
+      "term": "miconazole",
+      "aliases": [],
+      "related": [],
+      "generalized": [
+        "antifungal medication"
+      ],
+      "tags": [],
+      "canonical_id": "drug:miconazole"
+    },
+    {
+      "term": "oxcarbazepine",
       "aliases": [
-        "paracetamol"
+        "trileptal"
       ],
       "related": [
-        "ibuprofen",
-        "aspirin"
+        "carbamazepine"
       ],
       "generalized": [
-        "pain medication"
+        "antiepileptic medication",
+        "neurological medication"
       ],
       "tags": [
-        "analgesic",
-        "pain"
+        "neurology",
+        "antiepileptic"
       ],
-      "canonical_id": "drug:acetaminophen"
+      "canonical_id": "drug:oxcarbazepine"
+    },
+    {
+      "term": "pazopanib",
+      "aliases": [
+        "votrient"
+      ],
+      "related": [
+        "sunitinib",
+        "sorafenib"
+      ],
+      "generalized": [
+        "targeted cancer therapy",
+        "oncology medication"
+      ],
+      "tags": [
+        "oncology",
+        "tki"
+      ],
+      "canonical_id": "drug:pazopanib"
     },
     {
       "term": "prednisone",
@@ -146,92 +268,23 @@
       "canonical_id": "drug:pregabalin"
     },
     {
-      "term": "oxcarbazepine",
+      "term": "sertraline",
       "aliases": [
-        "trileptal"
+        "zoloft"
       ],
       "related": [
-        "carbamazepine"
+        "fluoxetine",
+        "escitalopram"
       ],
-      "generalized": [
-        "antiepileptic medication",
-        "neurological medication"
-      ],
-      "tags": [
-        "neurology",
-        "antiepileptic"
-      ],
-      "canonical_id": "drug:oxcarbazepine"
-    },
-    {
-      "term": "levothyroxine",
-      "aliases": [
-        "euthyrox"
-      ],
-      "related": [
-        "thyroxine"
-      ],
-      "generalized": [
-        "thyroid medication",
-        "hormone replacement therapy"
-      ],
-      "tags": [
-        "endocrine",
-        "thyroid"
-      ],
-      "canonical_id": "drug:levothyroxine"
-    },
-    {
-      "term": "ibuprofen",
-      "aliases": [],
-      "related": [],
-      "generalized": [
-        "pain medication",
-        "anti inflammatory medication"
-      ],
-      "tags": [],
-      "canonical_id": "drug:ibuprofen"
-    },
-    {
-      "term": "aspirin",
-      "aliases": [],
-      "related": [],
-      "generalized": [
-        "pain medication",
-        "anti inflammatory medication"
-      ],
-      "tags": [],
-      "canonical_id": "drug:aspirin"
-    },
-    {
-      "term": "fluoxetine",
-      "aliases": [],
-      "related": [],
       "generalized": [
         "antidepressant medication",
         "psychiatric medication"
       ],
-      "tags": [],
-      "canonical_id": "drug:fluoxetine"
-    },
-    {
-      "term": "escitalopram",
-      "aliases": [],
-      "related": [],
-      "generalized": [
-        "antidepressant medication",
-        "psychiatric medication"
+      "tags": [
+        "ssri",
+        "psychiatric"
       ],
-      "tags": [],
-      "canonical_id": "drug:escitalopram"
-    },
-    {
-      "term": "sunitinib",
-      "aliases": [],
-      "related": [],
-      "generalized": [],
-      "tags": [],
-      "canonical_id": "drug:sunitinib"
+      "canonical_id": "drug:sertraline"
     },
     {
       "term": "sorafenib",
@@ -242,30 +295,12 @@
       "canonical_id": "drug:sorafenib"
     },
     {
-      "term": "azithromycin",
+      "term": "sunitinib",
       "aliases": [],
       "related": [],
       "generalized": [],
       "tags": [],
-      "canonical_id": "drug:azithromycin"
-    },
-    {
-      "term": "doxycycline",
-      "aliases": [],
-      "related": [],
-      "generalized": [],
-      "tags": [],
-      "canonical_id": "drug:doxycycline"
-    },
-    {
-      "term": "miconazole",
-      "aliases": [],
-      "related": [],
-      "generalized": [
-        "antifungal medication"
-      ],
-      "tags": [],
-      "canonical_id": "drug:miconazole"
+      "canonical_id": "drug:sunitinib"
     }
   ]
 }

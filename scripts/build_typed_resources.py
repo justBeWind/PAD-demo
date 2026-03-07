@@ -1,8 +1,16 @@
 import argparse
+import hashlib
 import json
 import os
 import re
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
+
+
+BUILDER_VERSION = "1.0.0"
+SCHEMA_VERSION = "typed_resource_v1"
+RELATED_TOP_K = 3
+RELATED_MIN_SCORE = 0.18
 
 
 DISEASE_GENERALIZATION_MAP = {
@@ -58,7 +66,36 @@ def slugify(text: str) -> str:
     return text or "unknown"
 
 
-def load_seed_records(path: str) -> list[dict]:
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_jsonl_records(path: str) -> list[dict | str]:
+    items: list[dict | str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parsed = json.loads(line)
+            if isinstance(parsed, dict) and "items" in parsed and isinstance(parsed["items"], list):
+                for item in parsed["items"]:
+                    if isinstance(item, (dict, str)):
+                        items.append(item)
+                continue
+            if isinstance(parsed, (dict, str)):
+                items.append(parsed)
+    return items
+
+
+def load_seed_records(path: str) -> list[dict | str]:
+    if path.lower().endswith(".jsonl"):
+        return _load_jsonl_records(path)
+
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
     if isinstance(payload, dict):
@@ -239,7 +276,7 @@ def build_drug_generalized(term: str, aliases: list[str], tags: list[str]) -> li
     return _merge_unique(generalized, term_lower)
 
 
-def build_related(records: list[dict], top_k: int = 3) -> list[dict]:
+def build_related(records: list[dict], top_k: int = RELATED_TOP_K, min_score: float = RELATED_MIN_SCORE) -> list[dict]:
     for index, record in enumerate(records):
         if record["related"]:
             continue
@@ -256,34 +293,120 @@ def build_related(records: list[dict], top_k: int = 3) -> list[dict]:
             score = lexical * 0.35 + overlap * 0.65
             scored.append((other["term"], score))
         scored.sort(key=lambda item: item[1], reverse=True)
-        record["related"] = [term for term, score in scored[:top_k] if score >= 0.18]
+        record["related"] = [term for term, score in scored[:top_k] if score >= min_score]
     return records
 
 
-def export_index(records: list[dict], output_path: str) -> None:
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    payload = {"items": records}
+def _merge_unique_list(base: list[str], extension: list[str], avoid_term: str) -> list[str]:
+    out = list(base)
+    lowered_avoid = avoid_term.lower()
+    seen = {item.lower() for item in out}
+    for item in extension:
+        norm = normalize_text(item)
+        if not norm:
+            continue
+        lowered = norm.lower()
+        if lowered == lowered_avoid or lowered in seen:
+            continue
+        out.append(norm)
+        seen.add(lowered)
+    return out
+
+
+def dedupe_records(records: list[dict]) -> tuple[list[dict], dict]:
+    by_term: dict[str, dict] = {}
+    stats = {
+        "normalized_records": 0,
+        "duplicates_merged": 0,
+    }
+    for record in records:
+        stats["normalized_records"] += 1
+        key = record["term"].lower()
+        if key not in by_term:
+            by_term[key] = dict(record)
+            continue
+        stats["duplicates_merged"] += 1
+        existing = by_term[key]
+        existing["aliases"] = _merge_unique_list(existing.get("aliases", []), record.get("aliases", []), existing["term"])
+        existing["related"] = _merge_unique_list(existing.get("related", []), record.get("related", []), existing["term"])
+        existing["generalized"] = _merge_unique_list(existing.get("generalized", []), record.get("generalized", []), existing["term"])
+        existing_tags = list(existing.get("tags", []))
+        for tag in record.get("tags", []):
+            tag_norm = normalize_text(tag).lower()
+            if tag_norm and tag_norm not in existing_tags:
+                existing_tags.append(tag_norm)
+        existing["tags"] = existing_tags
+        if not existing.get("canonical_id"):
+            existing["canonical_id"] = record.get("canonical_id", existing["canonical_id"])
+    return sorted(by_term.values(), key=lambda item: item["term"].lower()), stats
+
+
+def export_index(records: list[dict], output_path: str, metadata: dict) -> dict:
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "metadata": metadata,
+        "items": records,
+    }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
         f.write("\n")
+    return payload
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build typed public resource indices for DenPAD.")
     parser.add_argument("--disease_source", type=str, help="Seed JSON or JSONL-compatible disease source.")
     parser.add_argument("--disease_output", type=str, help="Output JSON path for the disease typed index.")
+    parser.add_argument("--disease_source_name", type=str, default="unspecified", help="Human-readable source name for disease provenance.")
+    parser.add_argument("--disease_source_url", type=str, default="", help="Source URL for disease provenance.")
+    parser.add_argument("--disease_source_license", type=str, default="", help="Source license for disease provenance.")
+    parser.add_argument("--disease_source_version", type=str, default="", help="Source version/date for disease provenance.")
     parser.add_argument("--drug_source", type=str, help="Seed JSON or JSONL-compatible drug source.")
     parser.add_argument("--drug_output", type=str, help="Output JSON path for the drug typed index.")
+    parser.add_argument("--drug_source_name", type=str, default="unspecified", help="Human-readable source name for drug provenance.")
+    parser.add_argument("--drug_source_url", type=str, default="", help="Source URL for drug provenance.")
+    parser.add_argument("--drug_source_license", type=str, default="", help="Source license for drug provenance.")
+    parser.add_argument("--drug_source_version", type=str, default="", help="Source version/date for drug provenance.")
+    parser.add_argument(
+        "--manifest_output",
+        type=str,
+        default=None,
+        help="Optional output path for typed resource manifest. Defaults to <output_dir>/typed_resource_manifest.json.",
+    )
     return parser.parse_args()
 
 
-def build_index(source_path: str, output_path: str, prefix: str) -> int:
+def source_metadata_from_args(args: argparse.Namespace, prefix: str) -> dict:
+    return {
+        "name": normalize_text(getattr(args, f"{prefix}_source_name", "unspecified")),
+        "url": normalize_text(getattr(args, f"{prefix}_source_url", "")),
+        "license": normalize_text(getattr(args, f"{prefix}_source_license", "")),
+        "version": normalize_text(getattr(args, f"{prefix}_source_version", "")),
+    }
+
+
+def build_index(
+    source_path: str,
+    output_path: str,
+    prefix: str,
+    source_metadata: dict | None = None,
+) -> dict:
     seed_items = load_seed_records(source_path)
-    records = []
+    raw_records = []
+    dropped_empty = 0
     for item in seed_items:
         record = normalize_record(item, prefix=prefix)
         if record is None:
+            dropped_empty += 1
             continue
+        raw_records.append(record)
+
+    records, dedupe_stats = dedupe_records(raw_records)
+    generalized_generated = 0
+    for record in records:
         if not record["generalized"]:
             if prefix == "disease":
                 record["generalized"] = build_disease_generalized(
@@ -293,10 +416,84 @@ def build_index(source_path: str, output_path: str, prefix: str) -> int:
                 record["generalized"] = build_drug_generalized(
                     record["term"], record["aliases"], record["tags"]
                 )
-        records.append(record)
-    records = build_related(records)
-    export_index(records, output_path)
-    return len(records)
+            if record["generalized"]:
+                generalized_generated += 1
+
+    related_missing_before = sum(1 for record in records if not record.get("related"))
+    records = build_related(records, top_k=RELATED_TOP_K, min_score=RELATED_MIN_SCORE)
+    related_filled = sum(1 for record in records if record.get("related")) - (len(records) - related_missing_before)
+    related_filled = max(0, related_filled)
+
+    source_sha = sha256_file(source_path)
+    metadata = {
+        "resource_type": prefix.upper(),
+        "builder_version": BUILDER_VERSION,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_path": source_path,
+        "source_sha256": source_sha,
+        "source_item_count": len(seed_items),
+        "record_count": len(records),
+        "source_metadata": source_metadata or {},
+        "build_stats": {
+            "raw_items": len(seed_items),
+            "dropped_empty": dropped_empty,
+            "normalized_records": dedupe_stats["normalized_records"],
+            "duplicates_merged": dedupe_stats["duplicates_merged"],
+            "generalized_generated": generalized_generated,
+            "related_filled": related_filled,
+        },
+        "normalization_policy": {
+            "whitespace_normalization": True,
+            "dedupe_case_insensitive": True,
+            "ascii_slug_canonical_ids": True,
+        },
+        "related_builder": {
+            "top_k": RELATED_TOP_K,
+            "min_score": RELATED_MIN_SCORE,
+            "lexical_weight": 0.35,
+            "tag_overlap_weight": 0.65,
+        },
+    }
+    export_index(records, output_path, metadata)
+    output_sha = sha256_file(output_path)
+    return {
+        "resource_type": prefix.upper(),
+        "output_path": output_path,
+        "output_sha256": output_sha,
+        "record_count": len(records),
+        "source_path": source_path,
+        "source_sha256": source_sha,
+        "source_item_count": len(seed_items),
+        "source_metadata": source_metadata or {},
+        "build_stats": metadata["build_stats"],
+    }
+
+
+def write_manifest(manifest_path: str, entries: list[dict]) -> None:
+    output_dir = os.path.dirname(manifest_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "manifest_version": "1",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "builder": {
+            "script": os.path.abspath(__file__),
+            "builder_version": BUILDER_VERSION,
+        },
+        "resources": entries,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def _default_manifest_path(args: argparse.Namespace) -> str:
+    if args.manifest_output:
+        return args.manifest_output
+    out_paths = [p for p in (args.disease_output, args.drug_output) if p]
+    base_dir = os.path.dirname(out_paths[0]) if out_paths else os.getcwd()
+    return os.path.join(base_dir, "typed_resource_manifest.json")
 
 
 def main() -> None:
@@ -309,12 +506,29 @@ def main() -> None:
     if bool(args.drug_source) ^ bool(args.drug_output):
         raise SystemExit("Both --drug_source and --drug_output must be provided together.")
 
+    entries: list[dict] = []
     if args.disease_source:
-        count = build_index(args.disease_source, args.disease_output, prefix="disease")
-        print(f"Wrote {count} disease resource records to {args.disease_output}")
+        result = build_index(
+            args.disease_source,
+            args.disease_output,
+            prefix="disease",
+            source_metadata=source_metadata_from_args(args, "disease"),
+        )
+        entries.append(result)
+        print(f"Wrote {result['record_count']} disease records to {args.disease_output}")
     if args.drug_source:
-        count = build_index(args.drug_source, args.drug_output, prefix="drug")
-        print(f"Wrote {count} drug resource records to {args.drug_output}")
+        result = build_index(
+            args.drug_source,
+            args.drug_output,
+            prefix="drug",
+            source_metadata=source_metadata_from_args(args, "drug"),
+        )
+        entries.append(result)
+        print(f"Wrote {result['record_count']} drug records to {args.drug_output}")
+
+    manifest_path = _default_manifest_path(args)
+    write_manifest(manifest_path, entries)
+    print(f"Wrote typed resource manifest to {manifest_path}")
 
 
 if __name__ == "__main__":

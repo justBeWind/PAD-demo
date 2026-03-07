@@ -1,0 +1,39 @@
+{
+  "classification": {
+    "min_score": 0.55,
+    "current_label_prior": 0.12,
+    "fallback_accept_confidence": 0.75
+  },
+  "high_risk": {
+    "org_gpe_confidence": 0.92,
+    "org_gpe_density": 0.18,
+    "org_gpe_min_confidence": 0.8
+  },
+  "weights": {
+    "resource": 1.2,
+    "model": 0.9,
+    "heuristic": 0.78
+  },
+  "heuristics": {
+    "disease_contains": [
+      " disease",
+      " syndrome",
+      "itis",
+      "emia",
+      "osis",
+      "alopecia",
+      "hyperthy",
+      "addison",
+      "graves"
+    ],
+    "drug_contains": [
+      "mab",
+      "azole",
+      "cycline",
+      "mycin",
+      "oxetine",
+      "metformin",
+      "thyroxine"
+    ]
+  }
+}

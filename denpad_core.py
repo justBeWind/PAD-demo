@@ -25,6 +25,7 @@ try:
 except ImportError:
     spacy = None
 
+from candidate_llm_completion import CandidateLLMCompletion
 from medical_typer import MedicalTyper
 from typed_candidate_index import TypedCandidateIndex
 
@@ -46,7 +47,6 @@ DEFAULT_ENTITY_LABELS = {
 }
 
 SENSITIVE_PRIORITY_LABELS = {
-    "PERSON",
     "EMAIL",
     "PHONE",
     "AGE",
@@ -61,7 +61,6 @@ SENSITIVE_PRIORITY_LABELS = {
 SENSITIVE_PRIORITY_ORDER = [
     "DRUG",
     "DISEASE",
-    "PERSON",
     "EMAIL",
     "PHONE",
     "AGE",
@@ -270,6 +269,7 @@ def get_default_resources_dir() -> str:
 @dataclass(frozen=True)
 class ResourceTerm:
     term: str
+    canonical_id: str = ""
     aliases: tuple[str, ...] = ()
     related: tuple[str, ...] = ()
     generalized: tuple[str, ...] = ()
@@ -299,18 +299,22 @@ class ResourceTerm:
 class ResourceRegistry:
     def __init__(self, resources_dir: Optional[str] = None) -> None:
         self.resources_dir = resources_dir or get_default_resources_dir()
+        self.loaded_resource_info: dict[str, dict[str, Any]] = {}
+        self.resource_manifest = self._load_manifest()
         self.records = {
             "DISEASE": self._load_records(
+                "DISEASE",
                 ["medical_disease_index.json", "disease_terms.json"],
                 DEFAULT_MEDICAL_DISEASE_TERMS,
             ),
             "DRUG": self._load_records(
+                "DRUG",
                 ["medical_drug_index.json", "drug_terms.json"],
                 DEFAULT_MEDICAL_DRUG_TERMS,
             ),
-            "PERSON": self._load_records("person_names.json", set(DEFAULT_FALLBACK_CANDIDATES["PERSON"])),
-            "ORG": self._load_records("org_terms.json", set(DEFAULT_FALLBACK_CANDIDATES["ORG"])),
-            "GPE": self._load_records("location_terms.json", set(DEFAULT_FALLBACK_CANDIDATES["GPE"])),
+            "PERSON": self._load_records("PERSON", "person_names.json", set(DEFAULT_FALLBACK_CANDIDATES["PERSON"])),
+            "ORG": self._load_records("ORG", "org_terms.json", set(DEFAULT_FALLBACK_CANDIDATES["ORG"])),
+            "GPE": self._load_records("GPE", "location_terms.json", set(DEFAULT_FALLBACK_CANDIDATES["GPE"])),
         }
         self.records["LOC"] = self.records["GPE"]
         self.disease_terms = self._flatten_terms("DISEASE")
@@ -318,8 +322,23 @@ class ResourceRegistry:
         self.person_names = self._flatten_terms("PERSON")
         self.org_terms = self._flatten_terms("ORG")
         self.location_terms = self._flatten_terms("GPE")
+        self.loaded_resource_info["LOC"] = self.loaded_resource_info.get("GPE", {})
 
-    def _load_records(self, filename: str | list[str], fallback: set[str]) -> list[ResourceTerm]:
+    def _load_manifest(self) -> dict[str, Any]:
+        manifest_path = os.path.join(self.resources_dir, "typed_resource_manifest.json")
+        if not os.path.exists(manifest_path):
+            return {}
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                payload["_manifest_path"] = manifest_path
+                return payload
+        except Exception as exc:
+            LOGGER.warning("Failed to load typed resource manifest %s: %s", manifest_path, exc)
+        return {}
+
+    def _load_records(self, category: str, filename: str | list[str], fallback: set[str]) -> list[ResourceTerm]:
         filenames = [filename] if isinstance(filename, str) else list(filename)
         last_error: Optional[Exception] = None
         for candidate_name in filenames:
@@ -329,11 +348,24 @@ class ResourceRegistry:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     payload = json.load(f)
-                items = payload.get("items", [])
+                if isinstance(payload, dict):
+                    items = payload.get("items", [])
+                    metadata = payload.get("metadata", {}) if isinstance(payload.get("metadata", {}), dict) else {}
+                elif isinstance(payload, list):
+                    items = payload
+                    metadata = {}
+                else:
+                    raise ValueError(f"Unsupported resource payload type: {type(payload).__name__}")
                 records = [self._parse_resource_item(item) for item in items]
                 loaded = [record for record in records if record is not None]
                 if loaded:
                     LOGGER.info("Loaded %d resource records from %s", len(loaded), path)
+                    self.loaded_resource_info[category] = {
+                        "source_file": path,
+                        "source_type": "file",
+                        "record_count": len(loaded),
+                        "metadata": metadata,
+                    }
                     return loaded
             except Exception as exc:
                 last_error = exc
@@ -342,18 +374,28 @@ class ResourceRegistry:
         if last_error is not None:
             LOGGER.warning("Falling back to built-in defaults after resource load errors.")
         records = [self._parse_resource_item(item) for item in sorted(fallback)]
-        return [record for record in records if record is not None]
+        fallback_records = [record for record in records if record is not None]
+        self.loaded_resource_info[category] = {
+            "source_file": None,
+            "source_type": "fallback",
+            "record_count": len(fallback_records),
+            "metadata": {},
+        }
+        return fallback_records
 
     def _parse_resource_item(self, item: Any) -> Optional[ResourceTerm]:
         if isinstance(item, str):
             normalized = normalize_entity_text(item)
             if not normalized:
                 return None
-            return ResourceTerm(term=normalized)
+            return ResourceTerm(term=normalized, canonical_id=f"auto:{normalized.lower().replace(' ', '_')}")
         if isinstance(item, dict):
             term = normalize_entity_text(str(item.get("term", "")).strip())
             if not term:
                 return None
+            canonical_id = normalize_entity_text(str(item.get("canonical_id", "")).strip())
+            if not canonical_id:
+                canonical_id = f"auto:{term.lower().replace(' ', '_')}"
             aliases = tuple(
                 normalize_entity_text(str(alias).strip())
                 for alias in item.get("aliases", [])
@@ -374,7 +416,14 @@ class ResourceRegistry:
                 for tag in item.get("tags", [])
                 if normalize_entity_text(str(tag).strip())
             )
-            return ResourceTerm(term=term, aliases=aliases, related=related, generalized=generalized, tags=tags)
+            return ResourceTerm(
+                term=term,
+                canonical_id=canonical_id,
+                aliases=aliases,
+                related=related,
+                generalized=generalized,
+                tags=tags,
+            )
         return None
 
     def _flatten_terms(self, category: str) -> set[str]:
@@ -449,6 +498,24 @@ class ResourceRegistry:
         normalized = normalize_entity_text(candidate).lower()
         return normalized in record.normalized_generalized
 
+    def get_resource_summary(self) -> dict[str, Any]:
+        summary = {
+            "resources_dir": self.resources_dir,
+            "manifest_loaded": bool(self.resource_manifest),
+            "manifest_path": self.resource_manifest.get("_manifest_path"),
+            "manifest_version": self.resource_manifest.get("manifest_version"),
+            "schema_version": self.resource_manifest.get("schema_version"),
+            "categories": {},
+        }
+        for category, info in self.loaded_resource_info.items():
+            summary["categories"][category] = {
+                "source_file": info.get("source_file"),
+                "source_type": info.get("source_type"),
+                "record_count": info.get("record_count", 0),
+                "metadata": info.get("metadata", {}),
+            }
+        return summary
+
 
 @dataclass
 class ExtractedEntity:
@@ -464,6 +531,7 @@ class ExtractedEntity:
     evidence_confidence: float = 0.0
     evidence_source: str = ""
     should_perturb: bool = True
+    candidate_trace: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -478,6 +546,12 @@ class PerturbationRecord:
     start_char: int
     end_char: int
     candidates: list[str] = field(default_factory=list)
+    candidate_levels: dict[str, str] = field(default_factory=dict)
+    candidate_sources: dict[str, str] = field(default_factory=dict)
+    candidate_scores: list[float] = field(default_factory=list)
+    candidate_probabilities: list[float] = field(default_factory=list)
+    selected_level: str = "unknown"
+    candidate_trace: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1003,12 +1077,14 @@ class CandidateGenerator:
         top_k: int = 20,
         semantic_reranker: Optional[SemanticReranker] = None,
         medical_typer: Optional[MedicalTyper] = None,
+        llm_completion: Optional[CandidateLLMCompletion] = None,
     ) -> None:
         self.density_scorer = density_scorer
         self.resource_registry = resource_registry or ResourceRegistry()
         self.top_k = top_k
         self.semantic_reranker = semantic_reranker or SemanticReranker()
         self.medical_typer = medical_typer or MedicalTyper(resource_registry=self.resource_registry)
+        self.llm_completion = llm_completion
         self.typed_index = TypedCandidateIndex(
             resource_registry=self.resource_registry,
             semantic_reranker=self.semantic_reranker,
@@ -1027,9 +1103,44 @@ class CandidateGenerator:
     def _generate_categorical_candidates(self, entity: ExtractedEntity) -> list[str]:
         normalized = entity.normalized_text
         candidates = [normalized]
+        source_map: dict[str, str] = {normalize_entity_text(normalized): "original"}
+        level_map: dict[str, str] = {normalize_entity_text(normalized): "original"}
         resource_record = self.resource_registry.find_record(entity.label, normalized)
+        if entity.label in {"DISEASE", "DRUG"} and self.llm_completion is not None:
+            completion = self.llm_completion.complete(normalized, entity.label)
+            for candidate in completion.generalized:
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate:
+                    candidates.append(normalized_candidate)
+                    source_map.setdefault(normalized_candidate, "llm_completion")
+                    level_map[normalized_candidate] = self._classify_llm_candidate_level(
+                        entity,
+                        normalized_candidate,
+                        preferred_level="generalized",
+                    )
+            for candidate in completion.safe_related:
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate:
+                    candidates.append(normalized_candidate)
+                    source_map.setdefault(normalized_candidate, "llm_completion")
+                    level_map.setdefault(
+                        normalized_candidate,
+                        self._classify_llm_candidate_level(
+                            entity,
+                            normalized_candidate,
+                            preferred_level="related",
+                        ),
+                    )
         resource_candidates = self._resource_pool_candidates(entity)
         candidates.extend(resource_candidates)
+        trace = entity.candidate_trace or {}
+        trace_sources = trace.get("candidate_sources", {})
+        trace_levels = trace.get("candidate_layers", {})
+        for candidate in resource_candidates:
+            normalized_candidate = normalize_entity_text(candidate)
+            if normalized_candidate:
+                source_map.setdefault(normalized_candidate, trace_sources.get(normalized_candidate, "record"))
+                level_map.setdefault(normalized_candidate, trace_levels.get(normalized_candidate, "global"))
         should_expand_distributional = (
             entity.label in {"DISEASE", "DRUG"}
             and len(resource_candidates) < max(4, self.top_k // 3)
@@ -1042,17 +1153,59 @@ class CandidateGenerator:
             )
         )
         if should_expand_distributional:
-            candidates.extend(self._distributional_candidates(entity))
+            distributional_candidates = self._distributional_candidates(entity)
+            candidates.extend(distributional_candidates)
+            for candidate in distributional_candidates:
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate:
+                    source_map.setdefault(normalized_candidate, "neighbor")
+                    level_map.setdefault(normalized_candidate, "neighbor")
         if not resource_candidates:
-            candidates.extend(self._medical_fallback_candidates(entity))
-            candidates.extend(DEFAULT_FALLBACK_CANDIDATES.get(entity.label, []))
+            medical_fallback = self._medical_fallback_candidates(entity)
+            candidates.extend(medical_fallback)
+            for candidate in medical_fallback:
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate:
+                    source_map.setdefault(normalized_candidate, "fallback")
+                    level_map.setdefault(normalized_candidate, "generalized" if entity.label in {"DISEASE", "DRUG"} else "global")
+            default_fallback = DEFAULT_FALLBACK_CANDIDATES.get(entity.label, [])
+            candidates.extend(default_fallback)
+            for candidate in default_fallback:
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate:
+                    source_map.setdefault(normalized_candidate, "global")
+                    level_map.setdefault(normalized_candidate, "global")
         elif entity.label not in {"DISEASE", "DRUG"}:
-            candidates.extend(DEFAULT_FALLBACK_CANDIDATES.get(entity.label, []))
-        filtered = [candidate for candidate in candidates if self._is_candidate_compatible(entity, candidate)]
+            default_fallback = DEFAULT_FALLBACK_CANDIDATES.get(entity.label, [])
+            candidates.extend(default_fallback)
+            for candidate in default_fallback:
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate:
+                    source_map.setdefault(normalized_candidate, "global")
+                    level_map.setdefault(normalized_candidate, "global")
+        filtered = [
+            candidate
+            for candidate in candidates
+            if self._is_candidate_compatible(
+                entity,
+                candidate,
+                candidate_source=source_map.get(normalize_entity_text(candidate)),
+                candidate_level=level_map.get(normalize_entity_text(candidate)),
+            )
+        ]
         deduped = self._dedupe_candidates(filtered, normalized)
         ranked = self._rank_candidates(entity, deduped)
         if entity.label in {"DISEASE", "DRUG"}:
             ranked = self._apply_medical_guardrails(entity, ranked)
+            ranked = self._ensure_generalized_floor(entity, ranked, minimum=2)
+        self._attach_candidate_sources(
+            entity,
+            ranked,
+            source_map,
+            default_source="global",
+            level_map=level_map,
+            default_level="global",
+        )
         return ranked
 
     def _generate_numeric_candidates(self, entity: ExtractedEntity) -> list[str]:
@@ -1060,21 +1213,35 @@ class CandidateGenerator:
         try:
             value = float(text)
         except ValueError:
+            self._attach_candidate_sources(
+                entity,
+                [text],
+                {normalize_entity_text(text): "original"},
+                default_source="numeric",
+            )
             return [text]
 
         candidates = [text]
+        source_map: dict[str, str] = {normalize_entity_text(text): "original"}
         if entity.label == "AGE":
             for delta in (-10, -5, -2, 2, 5, 10):
                 candidate = min(max(int(round(value + delta)), 0), 120)
                 candidates.append(str(candidate))
+                source_map.setdefault(normalize_entity_text(str(candidate)), "numeric")
         else:
             for delta in (-3, -2, -1, 1, 2, 3):
                 candidate = value + delta
                 if text.isdigit():
-                    candidates.append(str(int(round(candidate))))
+                    formatted = str(int(round(candidate)))
+                    candidates.append(formatted)
+                    source_map.setdefault(normalize_entity_text(formatted), "numeric")
                 else:
-                    candidates.append(f"{candidate:.1f}")
-        return self._dedupe_candidates(candidates, text)
+                    formatted = f"{candidate:.1f}"
+                    candidates.append(formatted)
+                    source_map.setdefault(normalize_entity_text(formatted), "numeric")
+        deduped = self._dedupe_candidates(candidates, text)
+        self._attach_candidate_sources(entity, deduped, source_map, default_source="numeric")
+        return deduped
 
     def _generate_structured_candidates(self, entity: ExtractedEntity) -> list[str]:
         text = entity.normalized_text
@@ -1082,17 +1249,66 @@ class CandidateGenerator:
             local, _, domain = text.partition("@")
             domain = domain or "example.com"
             candidates = [text]
+            source_map: dict[str, str] = {normalize_entity_text(text): "original"}
             for prefix in ("user", "contact", "member", "patient"):
-                candidates.append(f"{prefix}{len(local)}@{domain}")
-            return self._dedupe_candidates(candidates, text)
+                candidate = f"{prefix}{len(local)}@{domain}"
+                candidates.append(candidate)
+                source_map.setdefault(normalize_entity_text(candidate), "structured")
+            deduped = self._dedupe_candidates(candidates, text)
+            self._attach_candidate_sources(entity, deduped, source_map, default_source="structured")
+            return deduped
 
         digits = re.sub(r"\D", "", text)
         candidates = [text]
+        source_map = {normalize_entity_text(text): "original"}
         if digits:
             for suffix in ("1234", "5678", "2468", "1357"):
                 new_digits = (digits[:-4] + suffix) if len(digits) >= 4 else suffix
                 candidates.append(new_digits)
-        return self._dedupe_candidates(candidates, text)
+                source_map.setdefault(normalize_entity_text(new_digits), "structured")
+        deduped = self._dedupe_candidates(candidates, text)
+        self._attach_candidate_sources(entity, deduped, source_map, default_source="structured")
+        return deduped
+
+    def _attach_candidate_sources(
+        self,
+        entity: ExtractedEntity,
+        candidates: list[str],
+        source_map: dict[str, str],
+        default_source: str,
+        level_map: Optional[dict[str, str]] = None,
+        default_level: str = "unknown",
+    ) -> None:
+        trace = dict(entity.candidate_trace or {})
+        existing_sources = {
+            normalize_entity_text(key): value
+            for key, value in (trace.get("candidate_sources") or {}).items()
+            if normalize_entity_text(key)
+        }
+        existing_levels = {
+            normalize_entity_text(key): value
+            for key, value in (trace.get("candidate_levels") or trace.get("candidate_layers") or {}).items()
+            if normalize_entity_text(key)
+        }
+        merged_sources = dict(existing_sources)
+        merged_levels = dict(existing_levels)
+        for candidate in candidates:
+            normalized_candidate = normalize_entity_text(candidate)
+            if not normalized_candidate:
+                continue
+            if normalized_candidate == normalize_entity_text(entity.normalized_text):
+                merged_sources[normalized_candidate] = "original"
+                merged_levels[normalized_candidate] = "original"
+            else:
+                merged_sources[normalized_candidate] = source_map.get(normalized_candidate, default_source)
+                if level_map is not None:
+                    merged_levels[normalized_candidate] = level_map.get(normalized_candidate, default_level)
+                else:
+                    merged_levels.setdefault(normalized_candidate, default_level)
+        trace["candidate_sources"] = merged_sources
+        trace["candidate_levels"] = merged_levels
+        trace["filtered_candidates"] = [normalize_entity_text(candidate) for candidate in candidates]
+        entity.candidate_trace = trace
 
     def _dedupe_candidates(self, candidates: list[str], original: str) -> list[str]:
         seen = set()
@@ -1107,7 +1323,13 @@ class CandidateGenerator:
             cleaned.insert(0, original)
         return cleaned[: self.top_k]
 
-    def _is_candidate_compatible(self, entity: ExtractedEntity, candidate: str) -> bool:
+    def _is_candidate_compatible(
+        self,
+        entity: ExtractedEntity,
+        candidate: str,
+        candidate_source: Optional[str] = None,
+        candidate_level: Optional[str] = None,
+    ) -> bool:
         candidate = normalize_entity_text(candidate)
         if not candidate:
             return False
@@ -1131,19 +1353,129 @@ class CandidateGenerator:
             if entity.label in {"PERSON", "ORG", "GPE", "LOC"} and candidate.lower() == candidate and len(candidate_tokens) <= 1:
                 return False
             if entity.label == "DISEASE" and not looks_like_disease_text(candidate, self.resource_registry):
-                return False
+                if not self._is_llm_generalized_candidate(entity, candidate, candidate_source, candidate_level):
+                    return False
             if entity.label == "DRUG" and not looks_like_drug_text(candidate, self.resource_registry):
-                return False
+                if not self._is_llm_generalized_candidate(entity, candidate, candidate_source, candidate_level):
+                    return False
             if entity.label in {"DISEASE", "DRUG", "PERSON", "ORG", "GPE", "LOC"}:
                 if not self.medical_typer.candidate_matches_label(candidate, entity.label):
-                    return False
+                    if not self._is_llm_generalized_candidate(entity, candidate, candidate_source, candidate_level):
+                        return False
             if entity.label in {"DISEASE", "DRUG"}:
                 if not self.medical_typer.candidate_group_matches(entity.normalized_text, candidate, entity.label):
-                    return False
+                    if not self._is_llm_generalized_candidate(entity, candidate, candidate_source, candidate_level):
+                        return False
         return True
 
+    def _is_llm_generalized_candidate(
+        self,
+        entity: ExtractedEntity,
+        candidate: str,
+        candidate_source: Optional[str],
+        candidate_level: Optional[str],
+    ) -> bool:
+        if candidate_source != "llm_completion":
+            return False
+        if candidate_level not in {"generalized", "related"}:
+            return False
+        return self._passes_llm_generalized_guard(entity, candidate)
+
+    def _passes_llm_generalized_guard(self, entity: ExtractedEntity, candidate: str) -> bool:
+        lowered = candidate.lower()
+        token_count = len(lowered.split())
+        if token_count == 0 or token_count > 4:
+            return False
+        if entity.label == "DISEASE":
+            allowed_last_tokens = {
+                "condition",
+                "disorder",
+                "disease",
+                "infection",
+                "syndrome",
+                "issue",
+            }
+            disallowed_specific_tokens = {
+                "eczema",
+                "psoriasis",
+                "arthritis",
+                "discitis",
+                "crohns",
+                "crohn",
+                "hepatitis",
+                "gonorrhea",
+                "alopecia",
+                "graves",
+                "hyperthyroid",
+                "hyperthyroidism",
+                "cancer",
+                "cirrhosis",
+                "anxiety",
+                "zoster",
+                "shingles",
+            }
+            tokens = [token for token in re.split(r"\s+", lowered) if token]
+            if not tokens or tokens[-1] not in allowed_last_tokens:
+                return False
+            if any(token in disallowed_specific_tokens for token in tokens[:-1]):
+                return False
+            if token_count == 1:
+                return False
+            return True
+        if entity.label == "DRUG":
+            allowed_last_tokens = {
+                "medication",
+                "medicine",
+                "drug",
+                "therapy",
+                "treatment",
+            }
+            disallowed_specific_tokens = {
+                "ibuprofen",
+                "prednisone",
+                "euthyrox",
+                "trileptal",
+                "acetaminophen",
+                "paracetamol",
+                "levothyroxine",
+                "thyroxine",
+                "pill",
+                "tablet",
+                "hormone",
+            }
+            tokens = [token for token in re.split(r"\s+", lowered) if token]
+            if not tokens or tokens[-1] not in allowed_last_tokens:
+                return False
+            if any(token in disallowed_specific_tokens for token in tokens[:-1]):
+                return False
+            if token_count == 1:
+                return False
+            return True
+        return False
+
+    def _classify_llm_candidate_level(
+        self,
+        entity: ExtractedEntity,
+        candidate: str,
+        preferred_level: str,
+    ) -> str:
+        if self._passes_llm_generalized_guard(entity, candidate):
+            return "generalized"
+        return preferred_level
+
     def _resource_pool_candidates(self, entity: ExtractedEntity) -> list[str]:
-        return self.typed_index.merge_and_filter(entity)
+        candidates, trace = self.typed_index.merge_and_filter(entity, return_trace=True)
+        entity.candidate_trace = {
+            "category": trace.category,
+            "original": trace.original,
+            "merged_before_filter": trace.merged_before_filter,
+            "filtered_candidates": trace.filtered_candidates,
+            "candidate_layers": trace.candidate_layers,
+            "candidate_sources": trace.candidate_sources,
+            "layer_counts": trace.layer_counts,
+            "record_hit": trace.record_hit,
+        }
+        return candidates
 
     def _distributional_candidates(self, entity: ExtractedEntity) -> list[str]:
         normalized = entity.normalized_text
@@ -1174,24 +1506,73 @@ class CandidateGenerator:
         if not candidates:
             return []
         original = entity.normalized_text
+        trace = entity.candidate_trace or {}
+        candidate_sources = trace.get("candidate_sources", {}) or {}
         scored = []
-        category = "GPE" if entity.label == "LOC" else entity.label
-        risk = self._entity_risk(entity)
         for candidate in candidates:
             semantic_score = self._candidate_similarity(original, candidate)
             lexical_score = SequenceMatcher(None, original.lower(), candidate.lower()).ratio()
             overlap_score = self._token_overlap(original, candidate)
             tag_bonus = self._tag_bonus(entity.label, original, candidate)
-            score = 0.55 * semantic_score + 0.2 * lexical_score + 0.15 * overlap_score + 0.10 * tag_bonus
-            level = self.resource_registry.candidate_level(category, original, candidate)
+            score = 0.48 * semantic_score + 0.08 * lexical_score + 0.06 * overlap_score + 0.08 * tag_bonus
+            level = self._candidate_level(entity, candidate)
+            risk = self._entity_risk(entity)
+            normalized_candidate = normalize_entity_text(candidate)
+            source = candidate_sources.get(normalized_candidate, candidate_sources.get(candidate, "global"))
             score += self._candidate_level_prior(entity, candidate, level, risk)
             score += self._entity_specific_candidate_adjustment(entity, candidate)
+            if source == "llm_completion" and level == "generalized" and entity.label in {"DISEASE", "DRUG"}:
+                score += 0.22 if entity.label == "DISEASE" else 0.16
+            if candidate != original and lexical_score >= 0.92:
+                score -= 0.30 if entity.label in {"DISEASE", "DRUG"} else 0.12
             scored.append((candidate, score))
         scored.sort(key=lambda item: item[1], reverse=True)
         ordered = [candidate for candidate, _ in scored]
         if original in ordered:
             ordered.remove(original)
         return [original, *ordered[: max(self.top_k - 1, 0)]]
+
+    def _ensure_generalized_floor(self, entity: ExtractedEntity, candidates: list[str], minimum: int = 2) -> list[str]:
+        if entity.label not in {"DISEASE", "DRUG"}:
+            return candidates
+        generalized = [candidate for candidate in candidates if self._candidate_level(entity, candidate) == "generalized"]
+        if len(generalized) >= minimum:
+            return self._retain_attack_candidates(entity, candidates)
+        original = entity.normalized_text
+        completed = list(candidates)
+        completion = self.llm_completion.complete(original, entity.label) if self.llm_completion is not None else None
+        if completion is not None:
+            for candidate in completion.generalized:
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate and normalized_candidate not in completed and self._is_candidate_compatible(entity, normalized_candidate):
+                    completed.append(normalized_candidate)
+                    trace = dict(entity.candidate_trace or {})
+                    candidate_sources = dict(trace.get("candidate_sources") or {})
+                    candidate_levels = dict(trace.get("candidate_levels") or trace.get("candidate_layers") or {})
+                    candidate_sources[normalized_candidate] = "llm_completion"
+                    candidate_levels[normalized_candidate] = "generalized"
+                    trace["candidate_sources"] = candidate_sources
+                    trace["candidate_levels"] = candidate_levels
+                    entity.candidate_trace = trace
+        completed = self._dedupe_candidates(completed, original)
+        generalized = [candidate for candidate in completed if self._candidate_level(entity, candidate) == "generalized"]
+        if len(generalized) < minimum:
+            return self._retain_attack_candidates(entity, completed)
+        non_generalized = [candidate for candidate in completed if candidate != original and self._candidate_level(entity, candidate) != "generalized"]
+        capped_tail = non_generalized[: max(self.top_k - (1 + len(generalized)), 0)]
+        narrowed = self._dedupe_candidates([original, *generalized, *capped_tail], original)
+        return self._retain_attack_candidates(entity, narrowed)
+
+    def _retain_attack_candidates(self, entity: ExtractedEntity, candidates: list[str]) -> list[str]:
+        if entity.label not in {"DISEASE", "DRUG"}:
+            return candidates
+        original = entity.normalized_text
+        generalized = [candidate for candidate in candidates if self._candidate_level(entity, candidate) == "generalized"]
+        if not generalized:
+            return self._dedupe_candidates(candidates, original)
+        ordered_generalized = list(dict.fromkeys(generalized))
+        limit = max(self.top_k - 1, 1)
+        return self._dedupe_candidates([original, *ordered_generalized[:limit]], original)
 
     def _candidate_similarity(self, original: str, candidate: str) -> float:
         if self.semantic_reranker.model is not None:
@@ -1372,10 +1753,14 @@ class CandidateGenerator:
         generalized = [
             candidate
             for candidate in candidates
-            if registry.candidate_level(category, entity.normalized_text, candidate) == "generalized"
+            if self._candidate_level(entity, candidate) == "generalized"
         ]
         if not generalized:
             return False
+        # For disease entities, once typed generalized candidates exist, always
+        # enter generalized-dominant mode to prevent verbatim disease leakage.
+        if entity.label == "DISEASE":
+            return True
         risk = self._entity_risk(entity)
         if risk >= 0.78:
             return True
@@ -1397,6 +1782,18 @@ class CandidateGenerator:
             "prednisone",
         )
         return any(pattern in lowered for pattern in trigger_patterns)
+
+    def _candidate_level(self, entity: ExtractedEntity, candidate: str) -> str:
+        trace = entity.candidate_trace or {}
+        normalized_candidate = normalize_entity_text(candidate)
+        levels = trace.get("candidate_levels") or trace.get("candidate_layers") or {}
+        if normalized_candidate in levels:
+            return levels[normalized_candidate]
+        registry = getattr(self, "resource_registry", None)
+        if registry is None:
+            return "unknown"
+        category = "GPE" if entity.label == "LOC" else entity.label
+        return registry.candidate_level(category, entity.normalized_text, candidate)
 
 
 class MechanismFactory:
@@ -1422,7 +1819,6 @@ class MechanismFactory:
         scores = [self._utility_score(entity, candidate) for candidate in candidates]
         if entity.label in {"DISEASE", "DRUG"}:
             risk = self.candidate_generator._entity_risk(entity)
-            registry = getattr(self.candidate_generator, "resource_registry", None)
             viable = [
                 candidate
                 for candidate, score in zip(candidates, scores)
@@ -1431,20 +1827,26 @@ class MechanismFactory:
             if viable:
                 candidates = viable
                 scores = [self._utility_score(entity, candidate) for candidate in candidates]
-            if registry is not None:
+            if getattr(self.candidate_generator, "resource_registry", None) is not None:
                 generalized = [
                     candidate
                     for candidate in candidates
-                    if registry.candidate_level(entity.label, entity.normalized_text, candidate) == "generalized"
+                    if self.candidate_generator._candidate_level(entity, candidate) == "generalized"
                 ]
                 if generalized and risk >= 0.55:
                     protected = []
-                    for candidate in candidates:
-                        level = registry.candidate_level(entity.label, entity.normalized_text, candidate)
-                        if candidate == entity.normalized_text:
-                            protected.append(candidate)
-                        elif level in {"generalized", "related"}:
-                            protected.append(candidate)
+                    if entity.label == "DISEASE":
+                        for candidate in candidates:
+                            level = self.candidate_generator._candidate_level(entity, candidate)
+                            if candidate == entity.normalized_text or level == "generalized":
+                                protected.append(candidate)
+                    else:
+                        for candidate in candidates:
+                            level = self.candidate_generator._candidate_level(entity, candidate)
+                            if candidate == entity.normalized_text:
+                                protected.append(candidate)
+                            elif level in {"generalized", "related"}:
+                                protected.append(candidate)
                     if protected:
                         candidates = self.candidate_generator._dedupe_candidates(protected, entity.normalized_text)
                         scores = [self._utility_score(entity, candidate) for candidate in candidates]
@@ -1452,7 +1854,7 @@ class MechanismFactory:
                     generalized = [
                         candidate
                         for candidate in candidates
-                        if registry.candidate_level(entity.label, entity.normalized_text, candidate) == "generalized"
+                        if self.candidate_generator._candidate_level(entity, candidate) == "generalized"
                     ]
                     if generalized:
                         protected = [*generalized]
@@ -1462,57 +1864,87 @@ class MechanismFactory:
                         boosted_scores = []
                         for candidate in candidates:
                             score = self._utility_score(entity, candidate)
-                            level = registry.candidate_level(entity.label, entity.normalized_text, candidate)
+                            level = self.candidate_generator._candidate_level(entity, candidate)
                             if candidate == entity.normalized_text:
-                                score -= 1.25
+                                score -= 2.35 if entity.label == "DISEASE" else 1.60
                             elif level == "generalized":
-                                score += 0.35
+                                score += 0.95 if entity.label == "DISEASE" else 0.55
                             boosted_scores.append(score)
                         scores = boosted_scores
-        sample = self._sample_exponential_mechanism(candidates, scores, entity.epsilon or 0.1)
+        epsilon = entity.epsilon or 0.1
+        probs = self._exponential_probabilities(scores, epsilon=epsilon)
+        sample = random.choices(candidates, weights=probs, k=1)[0]
+        candidate_levels = self._candidate_level_map(entity, candidates)
+        candidate_sources = self._candidate_source_map(entity, candidates)
         return PerturbationRecord(
             original_text=entity.text,
             perturbed_text=sample,
             label=entity.label,
             category=entity.category,
-            epsilon=entity.epsilon or 0.0,
+            epsilon=epsilon,
             density=entity.density or 0.0,
             mechanism="categorical_exponential",
             start_char=entity.start_char,
             end_char=entity.end_char,
             candidates=candidates,
+            candidate_levels=candidate_levels,
+            candidate_sources=candidate_sources,
+            candidate_scores=scores,
+            candidate_probabilities=probs,
+            selected_level=candidate_levels.get(sample, "unknown"),
+            candidate_trace=entity.candidate_trace,
         )
 
     def _perturb_numeric(self, entity: ExtractedEntity, candidates: list[str]) -> PerturbationRecord:
         scores = [self._numeric_utility(entity.normalized_text, candidate) for candidate in candidates]
-        sample = self._sample_exponential_mechanism(candidates, scores, entity.epsilon or 0.1)
+        epsilon = entity.epsilon or 0.1
+        probs = self._exponential_probabilities(scores, epsilon=epsilon)
+        sample = random.choices(candidates, weights=probs, k=1)[0]
+        candidate_levels = self._candidate_level_map(entity, candidates)
+        candidate_sources = self._candidate_source_map(entity, candidates)
         return PerturbationRecord(
             original_text=entity.text,
             perturbed_text=sample,
             label=entity.label,
             category=entity.category,
-            epsilon=entity.epsilon or 0.0,
+            epsilon=epsilon,
             density=entity.density or 0.0,
             mechanism="numeric_exponential",
             start_char=entity.start_char,
             end_char=entity.end_char,
             candidates=candidates,
+            candidate_levels=candidate_levels,
+            candidate_sources=candidate_sources,
+            candidate_scores=scores,
+            candidate_probabilities=probs,
+            selected_level=candidate_levels.get(sample, "unknown"),
+            candidate_trace=entity.candidate_trace,
         )
 
     def _perturb_structured(self, entity: ExtractedEntity, candidates: list[str]) -> PerturbationRecord:
         scores = [self._structured_utility(entity.normalized_text, candidate, entity.label) for candidate in candidates]
-        sample = self._sample_exponential_mechanism(candidates, scores, entity.epsilon or 0.1)
+        epsilon = entity.epsilon or 0.1
+        probs = self._exponential_probabilities(scores, epsilon=epsilon)
+        sample = random.choices(candidates, weights=probs, k=1)[0]
+        candidate_levels = self._candidate_level_map(entity, candidates)
+        candidate_sources = self._candidate_source_map(entity, candidates)
         return PerturbationRecord(
             original_text=entity.text,
             perturbed_text=sample,
             label=entity.label,
             category=entity.category,
-            epsilon=entity.epsilon or 0.0,
+            epsilon=epsilon,
             density=entity.density or 0.0,
             mechanism="structured_exponential",
             start_char=entity.start_char,
             end_char=entity.end_char,
             candidates=candidates,
+            candidate_levels=candidate_levels,
+            candidate_sources=candidate_sources,
+            candidate_scores=scores,
+            candidate_probabilities=probs,
+            selected_level=candidate_levels.get(sample, "unknown"),
+            candidate_trace=entity.candidate_trace,
         )
 
     def _utility_score(self, entity: ExtractedEntity, candidate: str) -> float:
@@ -1522,13 +1954,19 @@ class MechanismFactory:
         semantic_sim = self._semantic_similarity(original, candidate)
         surface_sim = SequenceMatcher(None, original.lower(), candidate.lower()).ratio()
         type_bonus = 1.0 if label in DEFAULT_FALLBACK_CANDIDATES or category == "categorical" else 0.5
-        score = 0.6 * semantic_sim + 0.3 * surface_sim + 0.1 * type_bonus
-        registry = getattr(self.candidate_generator, "resource_registry", None)
-        if registry is not None:
-            category_label = "GPE" if label == "LOC" else label
-            level = registry.candidate_level(category_label, original, candidate)
-            risk = self.candidate_generator._entity_risk(entity)
-            score += self.candidate_generator._candidate_level_prior(entity, candidate, level, risk)
+        overlap = self.candidate_generator._token_overlap(original, candidate)
+        risk = self.candidate_generator._entity_risk(entity)
+        level = self.candidate_generator._candidate_level(entity, candidate)
+        score = 0.68 * semantic_sim + 0.06 * surface_sim + 0.06 * overlap + 0.08 * type_bonus
+        score += self.candidate_generator._candidate_level_prior(entity, candidate, level, risk)
+        if candidate == original:
+            score -= 1.00 if label in {"DISEASE", "DRUG"} else 0.25
+        elif surface_sim >= 0.94 or overlap >= 0.90:
+            score -= 0.55 if label in {"DISEASE", "DRUG"} else 0.15
+        if level == "generalized":
+            score += 0.55 if label == "DISEASE" else 0.35
+        elif level == "related":
+            score += 0.08 if label in {"DISEASE", "DRUG"} else 0.02
         score += self.candidate_generator._entity_specific_candidate_adjustment(entity, candidate)
         return score
 
@@ -1575,9 +2013,42 @@ class MechanismFactory:
             raise ValueError("Candidates must be non-empty.")
         if len(candidates) == 1:
             return candidates[0]
-        logits = [epsilon * score / (2.0 * max(delta_u, 1e-9)) for score in scores]
-        probs = safe_softmax(logits)
+        probs = self._exponential_probabilities(scores, epsilon=epsilon, delta_u=delta_u)
         return random.choices(candidates, weights=probs, k=1)[0]
+
+    def _exponential_probabilities(
+        self,
+        scores: list[float],
+        epsilon: float,
+        delta_u: float = 1.0,
+    ) -> list[float]:
+        logits = [epsilon * score / (2.0 * max(delta_u, 1e-9)) for score in scores]
+        return safe_softmax(logits)
+
+    def _candidate_level_map(self, entity: ExtractedEntity, candidates: list[str]) -> dict[str, str]:
+        return {
+            candidate: self.candidate_generator._candidate_level(entity, candidate)
+            for candidate in candidates
+        }
+
+    def _candidate_source_map(self, entity: ExtractedEntity, candidates: list[str]) -> dict[str, str]:
+        trace = entity.candidate_trace or {}
+        sources = trace.get("candidate_sources", {}) if isinstance(trace, dict) else {}
+        if entity.category == "numeric":
+            default_source = "numeric"
+        elif entity.category == "structured":
+            default_source = "structured"
+        else:
+            default_source = "global"
+        source_map = {}
+        normalized_original = normalize_entity_text(entity.normalized_text)
+        for candidate in candidates:
+            normalized_candidate = normalize_entity_text(candidate)
+            if normalized_candidate == normalized_original:
+                source_map[candidate] = "original"
+                continue
+            source_map[candidate] = sources.get(normalized_candidate, sources.get(candidate, default_source))
+        return source_map
 
 
 class DenPADSanitizer:
@@ -1591,17 +2062,24 @@ class DenPADSanitizer:
         min_epsilon: float = 0.05,
         resources_dir: Optional[str] = None,
         medical_ner_backend: Optional[str] = None,
+        medical_typer_config: Optional[str] = None,
         enable_medical_ner: bool = True,
+        disable_age_date: bool = False,
         min_candidate_score: float = 0.25,
+        candidate_llm_model: Optional[str] = "Qwen/Qwen2.5-3B-Instruct",
+        candidate_llm_topk: int = 5,
         seed: int = 42,
     ) -> None:
         seed_everything(seed)
         self.epsilon_doc = epsilon_doc
         self.resource_registry = ResourceRegistry(resources_dir=resources_dir)
+        self.disable_age_date = disable_age_date
+        self.candidate_llm_model = candidate_llm_model
         self.medical_typer = MedicalTyper(
             resource_registry=self.resource_registry,
             model_name=medical_ner_backend,
             enable_medical_ner=enable_medical_ner,
+            config_path=medical_typer_config,
         )
         self.extractor = EntityExtractor(
             resource_registry=self.resource_registry,
@@ -1609,6 +2087,10 @@ class DenPADSanitizer:
         )
         self.density_scorer = DensityScorer(backend=density_backend, k=density_k)
         self.semantic_reranker = SemanticReranker()
+        self.llm_completion = CandidateLLMCompletion(
+            model_name=candidate_llm_model,
+            top_k=candidate_llm_topk,
+        )
         self.budget_allocator = BudgetAllocator(
             epsilon_doc=epsilon_doc,
             lambda_smooth=lambda_smooth,
@@ -1620,6 +2102,7 @@ class DenPADSanitizer:
             top_k=candidate_topk,
             semantic_reranker=self.semantic_reranker,
             medical_typer=self.medical_typer,
+            llm_completion=self.llm_completion,
         )
         self.mechanism_factory = MechanismFactory(
             candidate_generator=self.candidate_generator,
@@ -1638,6 +2121,8 @@ class DenPADSanitizer:
         result_metadata["num_entities"] = len(entities)
         result_metadata["num_perturbed"] = len(perturbations)
         result_metadata["epsilon_doc"] = self.epsilon_doc
+        result_metadata["disable_age_date"] = self.disable_age_date
+        result_metadata["candidate_llm_model"] = self.candidate_llm_model
         return SanitizationResult(
             original_text=text,
             sanitized_text=sanitized_text,
@@ -1668,6 +2153,12 @@ class DenPADSanitizer:
             sanitized_documents.append(document.__class__(page_content=result.sanitized_text, metadata=metadata))
 
             for record in result.perturbations:
+                selected_source = record.candidate_sources.get(
+                    record.perturbed_text,
+                    "original" if record.perturbed_text == record.original_text else (
+                        "numeric" if record.category == "numeric" else ("structured" if record.category == "structured" else "global")
+                    ),
+                )
                 audit_records.append(
                     {
                         "doc_index": index,
@@ -1679,6 +2170,13 @@ class DenPADSanitizer:
                         "density": record.density,
                         "mechanism": record.mechanism,
                         "candidates": record.candidates,
+                        "candidate_levels": record.candidate_levels,
+                        "candidate_sources": record.candidate_sources,
+                        "candidate_scores": record.candidate_scores,
+                        "candidate_probabilities": record.candidate_probabilities,
+                        "selected_level": record.selected_level,
+                        "selected_source": selected_source,
+                        "candidate_trace": record.candidate_trace,
                     }
                 )
         return sanitized_documents, audit_records
@@ -1713,6 +2211,12 @@ class DenPADSanitizer:
                 sanitized_snippet = sanitized_docs[index][
                     max(record.start_char - 40, 0) : min(record.start_char + len(record.perturbed_text) + 40, len(sanitized_docs[index]))
                 ]
+                selected_source = record.candidate_sources.get(
+                    record.perturbed_text,
+                    "original" if record.perturbed_text == record.original_text else (
+                        "numeric" if record.category == "numeric" else ("structured" if record.category == "structured" else "global")
+                    ),
+                )
                 audit_records.append(
                     {
                         "doc_index": index,
@@ -1724,11 +2228,24 @@ class DenPADSanitizer:
                         "density": record.density,
                         "mechanism": record.mechanism,
                         "candidates": record.candidates,
+                        "candidate_levels": record.candidate_levels,
+                        "candidate_sources": record.candidate_sources,
+                        "candidate_scores": record.candidate_scores,
+                        "candidate_probabilities": record.candidate_probabilities,
+                        "selected_level": record.selected_level,
+                        "selected_source": selected_source,
+                        "candidate_trace": record.candidate_trace,
                         "original_doc_snippet": original_snippet,
                         "sanitized_doc_snippet": sanitized_snippet,
                     }
                 )
-
+        level_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
+        for record in audit_records:
+            level = record.get("selected_level", "unknown")
+            level_counts[level] = level_counts.get(level, 0) + 1
+            source = record.get("selected_source", "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
         return sanitized_docs, {
             "query": query,
             "num_docs": len(docs),
@@ -1736,6 +2253,11 @@ class DenPADSanitizer:
             "num_perturbed": total_perturbed,
             "epsilon_doc": self.epsilon_doc,
             "epsilon_query": self.epsilon_doc,
+            "disable_age_date": self.disable_age_date,
+            "selected_level_counts": level_counts,
+            "selected_source_counts": source_counts,
+            "resource_summary": self.resource_registry.get_resource_summary(),
+            "resource_manifest": self.resource_registry.resource_manifest,
             "audit_records": audit_records,
         }
 
@@ -1744,6 +2266,9 @@ class DenPADSanitizer:
         for entity in entities:
             if entity.density is None:
                 entity.density = self.density_scorer.score_entity(entity.normalized_text, entity.label)
+            if self.disable_age_date and entity.label in {"AGE", "DATE"}:
+                entity.should_perturb = False
+                continue
             if self.medical_typer.is_generic_sensitive(entity.label, entity.normalized_text.lower()):
                 entity.should_perturb = False
                 continue
@@ -1752,6 +2277,7 @@ class DenPADSanitizer:
                 entity.label,
                 density=entity.density,
                 evidence_confidence=entity.evidence_confidence,
+                evidence_source=entity.evidence_source,
             ):
                 entity.should_perturb = False
                 continue

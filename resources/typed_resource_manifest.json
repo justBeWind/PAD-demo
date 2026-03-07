@@ -1,0 +1,57 @@
+{
+  "schema_version": "typed_resource_v1",
+  "manifest_version": "1",
+  "generated_at_utc": "2026-03-05T06:23:58.166723+00:00",
+  "builder": {
+    "script": "/root/autodl-tmp/PAD-demo/scripts/build_typed_resources.py",
+    "builder_version": "1.0.0"
+  },
+  "resources": [
+    {
+      "resource_type": "DISEASE",
+      "output_path": "/root/autodl-tmp/PAD-demo/resources/medical_disease_index.json",
+      "output_sha256": "ba2b5ee1137a3b0f79e6b816a48e6eb522ebf00b5879ac7efbf6b58c37ad8072",
+      "record_count": 36,
+      "source_path": "/root/autodl-tmp/PAD-demo/resources/disease_terms.json",
+      "source_sha256": "a9cbe021aad84e87e0710b76bed2d44f12863e3f41f7e91baa2e09dc074a6d80",
+      "source_item_count": 37,
+      "source_metadata": {
+        "name": "unspecified",
+        "url": "",
+        "license": "",
+        "version": ""
+      },
+      "build_stats": {
+        "raw_items": 37,
+        "dropped_empty": 0,
+        "normalized_records": 37,
+        "duplicates_merged": 1,
+        "generalized_generated": 10,
+        "related_filled": 0
+      }
+    },
+    {
+      "resource_type": "DRUG",
+      "output_path": "/root/autodl-tmp/PAD-demo/resources/medical_drug_index.json",
+      "output_sha256": "6715b92905cad341588d9be96c6977d36c341eead7f7b9d25f0d21693dfe3e7a",
+      "record_count": 19,
+      "source_path": "/root/autodl-tmp/PAD-demo/resources/drug_terms.json",
+      "source_sha256": "e528a0178d9b3caa58fc6d5173ffd894f703c7c2ada58be235e3991b46cd089e",
+      "source_item_count": 19,
+      "source_metadata": {
+        "name": "unspecified",
+        "url": "",
+        "license": "",
+        "version": ""
+      },
+      "build_stats": {
+        "raw_items": 19,
+        "dropped_empty": 0,
+        "normalized_records": 19,
+        "duplicates_merged": 0,
+        "generalized_generated": 6,
+        "related_filled": 0
+      }
+    }
+  ]
+}

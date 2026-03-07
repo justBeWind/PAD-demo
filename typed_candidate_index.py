@@ -12,6 +12,18 @@ class CandidateBundle:
     neighbor_candidates: list[str]
 
 
+@dataclass(frozen=True)
+class CandidateTrace:
+    category: str
+    original: str
+    merged_before_filter: list[str]
+    filtered_candidates: list[str]
+    candidate_layers: dict[str, str]
+    candidate_sources: dict[str, str]
+    layer_counts: dict[str, int]
+    record_hit: bool
+
+
 class TypedCandidateIndex:
     """
     Typed public resource base + typed nearest-neighbor expansion.
@@ -45,17 +57,43 @@ class TypedCandidateIndex:
             neighbor_candidates=neighbor_candidates,
         )
 
-    def merge_and_filter(self, entity) -> list[str]:
+    def merge_and_filter(self, entity, return_trace: bool = False):
         bundle = self.build(entity)
-        candidates = [entity.normalized_text, *bundle.record_candidates]
+        merged_before_filter = []
+        candidate_layers = {}
+        candidate_sources = {}
+        category = "GPE" if entity.label == "LOC" else entity.label
+
+        def _append_with_source(candidate: str, source: str) -> None:
+            normalized = " ".join(str(candidate).split()).strip()
+            if not normalized:
+                return
+            merged_before_filter.append(normalized)
+            if normalized not in candidate_layers:
+                if source == "record":
+                    level = self.resource_registry.candidate_level(category, entity.normalized_text, normalized)
+                    candidate_layers[normalized] = level
+                elif source == "neighbor":
+                    candidate_layers[normalized] = "neighbor"
+                else:
+                    candidate_layers[normalized] = "global"
+                candidate_sources[normalized] = source
+
+        _append_with_source(entity.normalized_text, "original")
+        for candidate in bundle.record_candidates:
+            _append_with_source(candidate, "record")
         if bundle.record_candidates and len(bundle.record_candidates) < 4:
-            candidates.extend(bundle.neighbor_candidates)
+            for candidate in bundle.neighbor_candidates:
+                _append_with_source(candidate, "neighbor")
         elif not bundle.record_candidates:
-            candidates.extend(bundle.global_candidates)
-            candidates.extend(bundle.neighbor_candidates)
+            for candidate in bundle.global_candidates:
+                _append_with_source(candidate, "global")
+            for candidate in bundle.neighbor_candidates:
+                _append_with_source(candidate, "neighbor")
+
         seen = set()
         filtered = []
-        for candidate in candidates:
+        for candidate in merged_before_filter:
             candidate = " ".join(str(candidate).split()).strip()
             if not candidate or candidate in seen:
                 continue
@@ -64,7 +102,24 @@ class TypedCandidateIndex:
                 if not self.typer.candidate_matches_label(candidate, entity.label):
                     continue
             filtered.append(candidate)
-        return filtered[: self.top_k]
+        filtered = filtered[: self.top_k]
+        if not return_trace:
+            return filtered
+        layer_counts: dict[str, int] = {}
+        for candidate in filtered:
+            layer = candidate_layers.get(candidate, "unknown")
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+        trace = CandidateTrace(
+            category=category,
+            original=entity.normalized_text,
+            merged_before_filter=merged_before_filter,
+            filtered_candidates=filtered,
+            candidate_layers={candidate: candidate_layers.get(candidate, "unknown") for candidate in filtered},
+            candidate_sources={candidate: candidate_sources.get(candidate, "unknown") for candidate in filtered},
+            layer_counts=layer_counts,
+            record_hit=bool(bundle.record_candidates),
+        )
+        return filtered, trace
 
     def _record_level_candidates(self, label: str, text: str) -> list[str]:
         record = self.resource_registry.find_record(label, text)

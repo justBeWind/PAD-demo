@@ -342,7 +342,11 @@ def main():
     parser.add_argument("--denpad_min_epsilon", type=float, default=0.05, help="Minimum per-entity epsilon for DenPAD-L.")
     parser.add_argument("--denpad_resources_dir", type=str, default="resources", help="Directory containing public resource JSON files for DenPAD-L.")
     parser.add_argument("--denpad_local_ner_backend", type=str, default=None, help="Optional local biomedical NER/type model for retrieval-time DenPAD.")
+    parser.add_argument("--denpad_typer_config", type=str, default=None, help="Optional JSON config for local MedicalTyper scoring thresholds and weights.")
+    parser.add_argument("--denpad_candidate_llm_model", type=str, default="Qwen/Qwen2.5-3B-Instruct", help="Local deterministic instruct model used to complete generalized DenPAD candidates. Use Qwen2.5 by default; Qwen3 requires a newer transformers runtime.")
+    parser.add_argument("--denpad_candidate_llm_topk", type=int, default=5, help="Fixed number of LLM-completed candidate phrases per entity.")
     parser.add_argument("--disable_denpad_medical_ner", action="store_true", help="Disable local medical type enhancement in retrieval-time DenPAD.")
+    parser.add_argument("--denpad_disable_age_date", action="store_true", help="Disable AGE/DATE perturbation in DenPAD (recommended for Track A stability).")
     parser.add_argument("--denpad_audit_file", type=str, default=None, help="Optional JSONL path for DenPAD-L perturbation audit records.")
     parser.add_argument("--debug_corpus_limit", type=int, default=None, help="Optional limit on corpus documents/chunks for fast debugging.")
     parser.add_argument("--debug_prompt_limit", type=int, default=None, help="Optional limit on evaluation prompts for fast debugging.")
@@ -396,11 +400,18 @@ def main():
                 args.denpad_candidate_topk,
             )
             logging.info(
-                "DenPAD-RT resources dir=%s, medical_ner=%s, local_ner_backend=%s, candidate_min_score=%s",
+                "DenPAD-RT resources dir=%s, medical_ner=%s, local_ner_backend=%s, typer_config=%s, disable_age_date=%s, candidate_min_score=%s",
                 args.denpad_resources_dir,
                 not args.disable_denpad_medical_ner,
                 args.denpad_local_ner_backend or "auto",
+                args.denpad_typer_config or "default(resources/medical_typer_config.json)",
+                args.denpad_disable_age_date,
                 args.denpad_candidate_min_score,
+            )
+            logging.info(
+                "DenPAD-RT local candidate completion model=%s, topk=%s",
+                args.denpad_candidate_llm_model or "disabled",
+                args.denpad_candidate_llm_topk,
             )
         elif args.method == "lprag":
             logging.info(f"LPRAG entity perturbation: ε={args.lprag_epsilon}")
@@ -613,8 +624,12 @@ def main():
             min_epsilon=args.denpad_min_epsilon,
             resources_dir=args.denpad_resources_dir,
             medical_ner_backend=args.denpad_local_ner_backend,
+            medical_typer_config=args.denpad_typer_config,
             enable_medical_ner=not args.disable_denpad_medical_ner,
+            disable_age_date=args.denpad_disable_age_date,
             min_candidate_score=args.denpad_candidate_min_score,
+            candidate_llm_model=args.denpad_candidate_llm_model,
+            candidate_llm_topk=args.denpad_candidate_llm_topk,
         )
 
     rag = RAGPipeline(

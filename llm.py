@@ -604,5 +604,10 @@ class RAGPipeline:
             result["denpad_query_epsilon"] = sanitization_metadata.get("epsilon_query", sanitization_metadata.get("epsilon_doc"))
             result["denpad_num_entities"] = sanitization_metadata.get("num_entities", 0)
             result["denpad_num_perturbed"] = sanitization_metadata.get("num_perturbed", 0)
+            result["denpad_disable_age_date"] = sanitization_metadata.get("disable_age_date", False)
+            result["denpad_selected_level_counts"] = sanitization_metadata.get("selected_level_counts", {})
+            result["denpad_selected_source_counts"] = sanitization_metadata.get("selected_source_counts", {})
+            result["denpad_resource_summary"] = sanitization_metadata.get("resource_summary", {})
+            result["denpad_resource_manifest"] = sanitization_metadata.get("resource_manifest", {})
             result["denpad_audit"] = sanitization_metadata.get("audit_records", [])
         return result

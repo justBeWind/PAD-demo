@@ -1,3 +1,5 @@
+import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
@@ -15,6 +17,50 @@ class TypeDecision:
     source: str
 
 
+DEFAULT_TYPER_CONFIG = {
+    "classification": {
+        "min_score": 0.55,
+        "current_label_prior": 0.12,
+        "fallback_accept_confidence": 0.75,
+    },
+    "high_risk": {
+        "org_gpe_confidence": 0.92,
+        "org_gpe_density": 0.18,
+        "org_gpe_min_confidence": 0.80,
+        "org_min_confidence_strict": 0.88,
+        "gpe_loc_min_confidence_strict": 0.95,
+        "gpe_loc_density_strict": 0.12,
+    },
+    "weights": {
+        "resource": 1.20,
+        "model": 0.90,
+        "heuristic": 0.78,
+    },
+    "heuristics": {
+        "disease_contains": [
+            " disease",
+            " syndrome",
+            "itis",
+            "emia",
+            "osis",
+            "alopecia",
+            "hyperthy",
+            "addison",
+            "graves",
+        ],
+        "drug_contains": [
+            "mab",
+            "azole",
+            "cycline",
+            "mycin",
+            "oxetine",
+            "metformin",
+            "thyroxine",
+        ],
+    },
+}
+
+
 class MedicalTyper:
     """
     Local type enhancer for retrieval-time DenPAD.
@@ -29,10 +75,12 @@ class MedicalTyper:
         resource_registry=None,
         model_name: Optional[str] = None,
         enable_medical_ner: bool = True,
+        config_path: Optional[str] = None,
     ) -> None:
         self.resource_registry = resource_registry
         self.enable_medical_ner = enable_medical_ner
         self.model_name = model_name or "en_ner_bc5cdr_md"
+        self.config = self._load_config(config_path)
         self.model = None
         if enable_medical_ner and spacy is not None:
             for candidate in (
@@ -53,10 +101,6 @@ class MedicalTyper:
         if not normalized:
             return TypeDecision(current_label or "UNKNOWN", 0.0, "empty")
 
-        if self._in_terms(lowered, "DRUG"):
-            return TypeDecision("DRUG", 0.99, "resource")
-        if self._in_terms(lowered, "DISEASE"):
-            return TypeDecision("DISEASE", 0.99, "resource")
         if self._looks_like_email(normalized):
             return TypeDecision("EMAIL", 0.99, "regex")
         if self._looks_like_phone(normalized):
@@ -64,15 +108,41 @@ class MedicalTyper:
         if self._looks_like_age(normalized):
             return TypeDecision("AGE", 0.95, "regex")
 
+        scores: dict[str, float] = {}
+        evidence_sources: list[str] = []
+        if self._in_terms(lowered, "DRUG"):
+            self._add_score(scores, "DRUG", self._weight("resource"))
+            evidence_sources.append("resource")
+        if self._in_terms(lowered, "DISEASE"):
+            self._add_score(scores, "DISEASE", self._weight("resource"))
+            evidence_sources.append("resource")
+
         if self.model is not None:
             decision = self._classify_with_model(normalized)
             if decision is not None:
-                return decision
+                self._add_score(scores, decision.label, self._weight("model"))
+                evidence_sources.append("model")
 
         heuristic = self._classify_with_heuristics(normalized, current_label)
         if heuristic is not None:
-            return heuristic
-        return TypeDecision(current_label or "UNKNOWN", 0.4, "fallback")
+            self._add_score(scores, heuristic.label, self._weight("heuristic"))
+            evidence_sources.append("heuristic")
+
+        if current_label and current_label != "UNKNOWN":
+            self._add_score(scores, current_label, self._classification("current_label_prior"))
+            evidence_sources.append("current_label")
+
+        if not scores:
+            return TypeDecision(current_label or "UNKNOWN", 0.4, "fallback")
+
+        best_label, best_score = max(scores.items(), key=lambda item: item[1])
+        min_score = self._classification("min_score")
+        if best_score < min_score:
+            return TypeDecision(current_label or "UNKNOWN", 0.4, "fallback")
+
+        confidence = max(0.40, min(0.99, best_score / 1.5))
+        source = "score_ensemble+" + "+".join(sorted(set(evidence_sources)))
+        return TypeDecision(best_label, confidence, source)
 
     def is_high_risk(
         self,
@@ -80,13 +150,14 @@ class MedicalTyper:
         label: str,
         density: Optional[float] = None,
         evidence_confidence: Optional[float] = None,
+        evidence_source: Optional[str] = None,
     ) -> bool:
         lowered = self._normalize(text).lower()
         if self.is_generic_sensitive(label, lowered):
             return False
         if label in {"EMAIL", "PHONE"}:
             return True
-        if label in {"DISEASE", "DRUG", "PERSON"}:
+        if label in {"DISEASE", "DRUG"}:
             return True
         if label == "AGE":
             return True
@@ -94,9 +165,30 @@ class MedicalTyper:
             return bool(re.search(r"\b(19|20)\d{2}\b", lowered) or re.search(r"\b\d{1,2}[/-]\d{1,2}\b", lowered))
         if label in {"ORG", "GPE", "LOC"}:
             confidence = evidence_confidence or 0.0
-            if confidence >= 0.92:
-                return True
-            if density is not None and density <= 0.18 and confidence >= 0.8:
+            source = (evidence_source or "").lower()
+            # Conservative guard: avoid perturbing location/org entities that are
+            # mainly heuristic artifacts, which destabilized v5.
+            if "heuristic" in source:
+                return False
+            # Restrict to resource-backed location/org evidence by default.
+            if "resource" not in source and "regex" not in source:
+                return False
+            if label == "ORG":
+                if confidence >= self._high_risk("org_min_confidence_strict"):
+                    return True
+                if (
+                    density is not None
+                    and density <= self._high_risk("org_gpe_density")
+                    and confidence >= self._high_risk("org_gpe_min_confidence")
+                ):
+                    return True
+                return False
+            # GPE/LOC are even stricter to prevent over-perturbing public geography.
+            if (
+                confidence >= self._high_risk("gpe_loc_min_confidence_strict")
+                and density is not None
+                and density <= self._high_risk("gpe_loc_density_strict")
+            ):
                 return True
             return False
         return False
@@ -129,9 +221,15 @@ class MedicalTyper:
         decision = self.classify(candidate, target_label)
         if target_label == "LOC":
             target_label = "GPE"
-        return decision.label == target_label or (
+        predicted_match = decision.label == target_label or (
             target_label == "GPE" and decision.label == "LOC"
         )
+        if not predicted_match:
+            return False
+        # Do not accept weak fallback matches as typed evidence.
+        if decision.source == "fallback":
+            return decision.confidence >= self._classification("fallback_accept_confidence")
+        return True
 
     def candidate_group_matches(self, original: str, candidate: str, target_label: str) -> bool:
         if target_label not in {"DISEASE", "DRUG"}:
@@ -181,14 +279,16 @@ class MedicalTyper:
 
     def _classify_with_heuristics(self, text: str, current_label: Optional[str]) -> Optional[TypeDecision]:
         lowered = text.lower()
-        if any(token in lowered for token in (" disease", " syndrome", "itis", "emia", "osis", "alopecia", "hyperthy", "addison", "graves")):
+        disease_tokens = self._heuristics("disease_contains")
+        drug_tokens = self._heuristics("drug_contains")
+        if any(token in lowered for token in disease_tokens):
             return TypeDecision("DISEASE", 0.78, "heuristic")
-        if any(token in lowered for token in ("mab", "azole", "cycline", "mycin", "oxetine", "metformin", "thyroxine")):
+        if any(token in lowered for token in drug_tokens):
             return TypeDecision("DRUG", 0.78, "heuristic")
         if current_label == "PERSON" and self._looks_like_person(text):
             return TypeDecision("PERSON", 0.75, "heuristic")
-        if current_label in {"ORG", "GPE", "LOC"} and self._looks_like_location_or_org(text, current_label):
-            return TypeDecision(current_label, 0.72, "heuristic")
+        if current_label == "ORG" and self._looks_like_location_or_org(text, current_label):
+            return TypeDecision("ORG", 0.72, "heuristic")
         return None
 
     def _in_terms(self, text: str, category: str) -> bool:
@@ -249,3 +349,48 @@ class MedicalTyper:
         if any(token in text for token in ("anxiety", "panic", "depress", "psychiatr", "mental health", "mood")):
             return "psychiatric"
         return None
+
+    def _load_config(self, config_path: Optional[str]) -> dict:
+        config = json.loads(json.dumps(DEFAULT_TYPER_CONFIG))
+        candidate_paths = []
+        if config_path:
+            candidate_paths.append(config_path)
+        elif self.resource_registry is not None and hasattr(self.resource_registry, "resources_dir"):
+            candidate_paths.append(os.path.join(self.resource_registry.resources_dir, "medical_typer_config.json"))
+
+        for path in candidate_paths:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    self._deep_merge(config, payload)
+            except Exception:
+                continue
+        return config
+
+    def _deep_merge(self, base: dict, update: dict) -> None:
+        for key, value in update.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._deep_merge(base[key], value)
+            else:
+                base[key] = value
+
+    def _add_score(self, scores: dict[str, float], label: str, weight: float) -> None:
+        if not label or label == "UNKNOWN":
+            return
+        scores[label] = scores.get(label, 0.0) + float(weight)
+
+    def _classification(self, key: str) -> float:
+        return float(self.config.get("classification", {}).get(key, DEFAULT_TYPER_CONFIG["classification"][key]))
+
+    def _high_risk(self, key: str) -> float:
+        return float(self.config.get("high_risk", {}).get(key, DEFAULT_TYPER_CONFIG["high_risk"][key]))
+
+    def _weight(self, key: str) -> float:
+        return float(self.config.get("weights", {}).get(key, DEFAULT_TYPER_CONFIG["weights"][key]))
+
+    def _heuristics(self, key: str) -> list[str]:
+        values = self.config.get("heuristics", {}).get(key, DEFAULT_TYPER_CONFIG["heuristics"][key])
+        return list(values) if isinstance(values, Iterable) and not isinstance(values, (str, bytes)) else list(DEFAULT_TYPER_CONFIG["heuristics"][key])
