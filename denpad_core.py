@@ -273,6 +273,7 @@ class ResourceTerm:
     aliases: tuple[str, ...] = ()
     related: tuple[str, ...] = ()
     generalized: tuple[str, ...] = ()
+    family: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
 
     @property
@@ -295,12 +296,17 @@ class ResourceTerm:
     def normalized_tags(self) -> tuple[str, ...]:
         return tuple(normalize_entity_text(tag).lower() for tag in self.tags if normalize_entity_text(tag))
 
+    @property
+    def normalized_family(self) -> tuple[str, ...]:
+        return tuple(normalize_entity_text(tag).lower() for tag in self.family if normalize_entity_text(tag))
+
 
 class ResourceRegistry:
     def __init__(self, resources_dir: Optional[str] = None) -> None:
         self.resources_dir = resources_dir or get_default_resources_dir()
         self.loaded_resource_info: dict[str, dict[str, Any]] = {}
         self.resource_manifest = self._load_manifest()
+        self.family_templates = self._load_family_templates()
         self.records = {
             "DISEASE": self._load_records(
                 "DISEASE",
@@ -317,8 +323,22 @@ class ResourceRegistry:
             "GPE": self._load_records("GPE", "location_terms.json", set(DEFAULT_FALLBACK_CANDIDATES["GPE"])),
         }
         self.records["LOC"] = self.records["GPE"]
-        self.disease_terms = self._flatten_terms("DISEASE")
-        self.drug_terms = self._flatten_terms("DRUG")
+        self.match_records = {
+            "DISEASE": self._load_records(
+                "DISEASE_MATCH",
+                "disease_terms.json",
+                set(DEFAULT_MEDICAL_DISEASE_TERMS),
+            ),
+            "DRUG": self._load_records(
+                "DRUG_MATCH",
+                "drug_terms.json",
+                set(DEFAULT_MEDICAL_DRUG_TERMS),
+            ),
+        }
+        self._record_lookup = self._build_record_lookup(self.records)
+        self._match_record_lookup = self._build_record_lookup(self.match_records)
+        self.disease_terms = self._flatten_terms("DISEASE", match_only=True)
+        self.drug_terms = self._flatten_terms("DRUG", match_only=True)
         self.person_names = self._flatten_terms("PERSON")
         self.org_terms = self._flatten_terms("ORG")
         self.location_terms = self._flatten_terms("GPE")
@@ -336,6 +356,20 @@ class ResourceRegistry:
                 return payload
         except Exception as exc:
             LOGGER.warning("Failed to load typed resource manifest %s: %s", manifest_path, exc)
+        return {}
+
+    def _load_family_templates(self) -> dict[str, dict[str, list[str]]]:
+        templates_path = os.path.join(self.resources_dir, "family_templates.json")
+        if not os.path.exists(templates_path):
+            return {}
+        try:
+            with open(templates_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            templates = payload.get("templates", {}) if isinstance(payload, dict) else {}
+            if isinstance(templates, dict):
+                return templates
+        except Exception as exc:
+            LOGGER.warning("Failed to load family templates %s: %s", templates_path, exc)
         return {}
 
     def _load_records(self, category: str, filename: str | list[str], fallback: set[str]) -> list[ResourceTerm]:
@@ -416,19 +450,41 @@ class ResourceRegistry:
                 for tag in item.get("tags", [])
                 if normalize_entity_text(str(tag).strip())
             )
+            family = tuple(
+                normalize_entity_text(str(tag).strip())
+                for tag in item.get("family", [])
+                if normalize_entity_text(str(tag).strip())
+            )
             return ResourceTerm(
                 term=term,
                 canonical_id=canonical_id,
                 aliases=aliases,
                 related=related,
                 generalized=generalized,
+                family=family,
                 tags=tags,
             )
         return None
 
-    def _flatten_terms(self, category: str) -> set[str]:
+    def _build_record_lookup(self, records_by_category: dict[str, list[ResourceTerm]]) -> dict[str, dict[str, ResourceTerm]]:
+        lookup: dict[str, dict[str, ResourceTerm]] = {}
+        for category, records in records_by_category.items():
+            category_lookup: dict[str, ResourceTerm] = {}
+            for record in records:
+                keys = {
+                    record.normalized_term,
+                    *record.normalized_aliases,
+                }
+                for key in keys:
+                    if key and key not in category_lookup:
+                        category_lookup[key] = record
+            lookup[category] = category_lookup
+        return lookup
+
+    def _flatten_terms(self, category: str, match_only: bool = False) -> set[str]:
         flattened = set()
-        for record in self.records.get(category, []):
+        records = self.match_records.get(category, []) if match_only else self.records.get(category, [])
+        for record in records:
             flattened.add(record.normalized_term)
             flattened.update(record.normalized_aliases)
             flattened.update(record.normalized_related)
@@ -451,17 +507,46 @@ class ResourceRegistry:
     def get_candidates(self, category: str) -> list[str]:
         return sorted(self.get_terms(category))
 
+    def _allow_public_record_match(self, category: str, text: str) -> bool:
+        normalized = normalize_entity_text(text).lower()
+        if category not in {"DISEASE", "DRUG"}:
+            return True
+        if not normalized:
+            return False
+        tokens = [token for token in re.split(r"\s+", normalized) if token]
+        if len(tokens) >= 2:
+            return True
+        if len(normalized) < 5:
+            return False
+        if normalized in {
+            "can",
+            "go",
+            "all",
+            "may",
+            "aid",
+            "ache",
+            "cold",
+            "gas",
+            "rash",
+            "pain",
+        }:
+            return False
+        if category == "DISEASE":
+            return any(hint in normalized for hint in MEDICAL_DISEASE_HINTS) or normalized in DEFAULT_MEDICAL_DISEASE_TERMS
+        return any(hint in normalized for hint in MEDICAL_DRUG_HINTS) or normalized in DEFAULT_MEDICAL_DRUG_TERMS
+
+    def find_anchor_record(self, category: str, text: str) -> Optional[ResourceTerm]:
+        normalized = normalize_entity_text(text).lower()
+        return self._match_record_lookup.get(category, {}).get(normalized)
+
     def find_record(self, category: str, text: str) -> Optional[ResourceTerm]:
         normalized = normalize_entity_text(text).lower()
-        for record in self.records.get(category, []):
-            if (
-                normalized == record.normalized_term
-                or normalized in record.normalized_aliases
-                or normalized in record.normalized_related
-                or normalized in record.normalized_generalized
-            ):
-                return record
-        return None
+        anchor = self.find_anchor_record(category, text)
+        if anchor is not None:
+            return anchor
+        if not self._allow_public_record_match(category, text):
+            return None
+        return self._record_lookup.get(category, {}).get(normalized)
 
     def get_candidates_for_query(self, category: str, text: str) -> list[str]:
         record = self.find_record(category, text)
@@ -470,6 +555,19 @@ class ResourceRegistry:
 
         candidates = [record.term, *record.aliases, *record.related, *record.generalized]
         return [normalize_entity_text(candidate) for candidate in candidates if normalize_entity_text(candidate)]
+
+    def get_family_templates_for_record(self, category: str, text: str) -> list[str]:
+        record = self.find_record(category, text)
+        if record is None:
+            return []
+        templates = []
+        family_map = self.family_templates.get(category, {}) if isinstance(self.family_templates, dict) else {}
+        for family in record.normalized_family:
+            for candidate in family_map.get(family, []):
+                normalized = normalize_entity_text(candidate)
+                if normalized and normalized not in templates:
+                    templates.append(normalized)
+        return templates
 
     def candidate_level(self, category: str, original: str, candidate: str) -> str:
         normalized_original = normalize_entity_text(original).lower()
@@ -1106,33 +1204,9 @@ class CandidateGenerator:
         source_map: dict[str, str] = {normalize_entity_text(normalized): "original"}
         level_map: dict[str, str] = {normalize_entity_text(normalized): "original"}
         resource_record = self.resource_registry.find_record(entity.label, normalized)
-        if entity.label in {"DISEASE", "DRUG"} and self.llm_completion is not None:
-            completion = self.llm_completion.complete(normalized, entity.label)
-            for candidate in completion.generalized:
-                normalized_candidate = normalize_entity_text(candidate)
-                if normalized_candidate:
-                    candidates.append(normalized_candidate)
-                    source_map.setdefault(normalized_candidate, "llm_completion")
-                    level_map[normalized_candidate] = self._classify_llm_candidate_level(
-                        entity,
-                        normalized_candidate,
-                        preferred_level="generalized",
-                    )
-            for candidate in completion.safe_related:
-                normalized_candidate = normalize_entity_text(candidate)
-                if normalized_candidate:
-                    candidates.append(normalized_candidate)
-                    source_map.setdefault(normalized_candidate, "llm_completion")
-                    level_map.setdefault(
-                        normalized_candidate,
-                        self._classify_llm_candidate_level(
-                            entity,
-                            normalized_candidate,
-                            preferred_level="related",
-                        ),
-                    )
         resource_candidates = self._resource_pool_candidates(entity)
-        candidates.extend(resource_candidates)
+        family_hints = self._resource_family_hints(entity, resource_record)
+        family_template_candidates = self._family_template_candidates(entity, normalized, family_hints)
         trace = entity.candidate_trace or {}
         trace_sources = trace.get("candidate_sources", {})
         trace_levels = trace.get("candidate_layers", {})
@@ -1141,6 +1215,102 @@ class CandidateGenerator:
             if normalized_candidate:
                 source_map.setdefault(normalized_candidate, trace_sources.get(normalized_candidate, "record"))
                 level_map.setdefault(normalized_candidate, trace_levels.get(normalized_candidate, "global"))
+        for candidate in family_template_candidates:
+            normalized_candidate = normalize_entity_text(candidate)
+            if normalized_candidate:
+                source_map[normalized_candidate] = "family_template"
+                level_map[normalized_candidate] = "generalized"
+        coverage_state = self._coverage_state(entity, resource_record, resource_candidates)
+        trace = dict(entity.candidate_trace or {})
+        trace["coverage_state"] = coverage_state
+        trace["resource_generalized_count"] = sum(
+            1 for candidate in resource_candidates if self._candidate_level(entity, candidate) == "generalized"
+        )
+        trace["resource_candidate_count"] = len(resource_candidates)
+        trace["resource_family_hints"] = list(family_hints)
+        entity.candidate_trace = trace
+        if entity.label in {"DISEASE", "DRUG"}:
+            llm_generated_candidates: list[str] = []
+            llm_approved_candidates: list[str] = []
+            llm_generation_raw = ""
+            llm_critique_raw = ""
+            if self.llm_completion is not None:
+                generation_result = self.llm_completion.generate_candidates_debug(normalized, entity.label, family_hints)
+                llm_generated_candidates = list(generation_result.generated)
+                llm_generation_raw = generation_result.raw_output
+                critique_result = self.llm_completion.critique_candidates_debug(
+                    normalized,
+                    entity.label,
+                    llm_generated_candidates,
+                    family_hints,
+                )
+                llm_approved_candidates = list(critique_result.approved)
+                llm_critique_raw = critique_result.raw_output
+            combined_generalized = []
+            for candidate in [*llm_approved_candidates, *family_template_candidates]:
+                normalized_candidate = normalize_entity_text(candidate)
+                if not normalized_candidate or normalized_candidate.lower() == normalized.lower():
+                    continue
+                if normalized_candidate not in combined_generalized:
+                    combined_generalized.append(normalized_candidate)
+                    source_map[normalized_candidate] = (
+                        "llm_completion" if normalized_candidate in {normalize_entity_text(c) for c in llm_approved_candidates} else "family_template"
+                    )
+                    level_map[normalized_candidate] = "generalized"
+            if not combined_generalized:
+                fallback_templates = self._medical_fallback_candidates(entity)
+                for candidate in fallback_templates:
+                    normalized_candidate = normalize_entity_text(candidate)
+                    if normalized_candidate and normalized_candidate.lower() != normalized.lower() and normalized_candidate not in combined_generalized:
+                        combined_generalized.append(normalized_candidate)
+                        source_map[normalized_candidate] = "fallback"
+                        level_map[normalized_candidate] = "generalized"
+            trace = dict(entity.candidate_trace or {})
+            trace["llm_generated_candidates"] = list(llm_generated_candidates)
+            trace["llm_approved_candidates"] = list(llm_approved_candidates)
+            trace["llm_generation_family_hints"] = list(family_hints)
+            trace["llm_generate_raw_output"] = llm_generation_raw
+            trace["llm_critique_raw_output"] = llm_critique_raw
+            trace["llm_generate_parsed"] = list(llm_generated_candidates)
+            trace["llm_generate_filtered_out"] = [
+                candidate for candidate in llm_generated_candidates if candidate not in llm_approved_candidates
+            ]
+            entity.candidate_trace = trace
+            candidates.extend(combined_generalized)
+            # Ranking and guardrails consult entity.candidate_trace via _candidate_level().
+            # Persist the current source/level maps before filtering so newly generated
+            # generalized candidates are not treated as unknown/global.
+            self._attach_candidate_sources(
+                entity,
+                candidates,
+                source_map,
+                default_source="global",
+                level_map=level_map,
+                default_level="global",
+            )
+            filtered = [
+                candidate
+                for candidate in candidates
+                if self._is_candidate_compatible(
+                    entity,
+                    candidate,
+                    candidate_source=source_map.get(normalize_entity_text(candidate)),
+                    candidate_level=level_map.get(normalize_entity_text(candidate)),
+                )
+            ]
+            deduped = self._dedupe_candidates(filtered, normalized)
+            ranked = self._rank_candidates(entity, deduped)
+            ranked = self._apply_medical_guardrails(entity, ranked)
+            ranked = self._ensure_generalized_floor(entity, ranked, minimum=2)
+            self._attach_candidate_sources(
+                entity,
+                ranked,
+                source_map,
+                default_source="global",
+                level_map=level_map,
+                default_level="global",
+            )
+            return ranked
         should_expand_distributional = (
             entity.label in {"DISEASE", "DRUG"}
             and len(resource_candidates) < max(4, self.top_k // 3)
@@ -1198,6 +1368,7 @@ class CandidateGenerator:
         if entity.label in {"DISEASE", "DRUG"}:
             ranked = self._apply_medical_guardrails(entity, ranked)
             ranked = self._ensure_generalized_floor(entity, ranked, minimum=2)
+            ranked = self._apply_llm_generalized_rerank(entity, ranked)
         self._attach_candidate_sources(
             entity,
             ranked,
@@ -1207,6 +1378,111 @@ class CandidateGenerator:
             default_level="global",
         )
         return ranked
+
+    def _coverage_state(
+        self,
+        entity: ExtractedEntity,
+        resource_record: Optional[ResourceTerm],
+        resource_candidates: list[str],
+    ) -> str:
+        if entity.label not in {"DISEASE", "DRUG"}:
+            return "resource_hit" if resource_candidates else "resource_miss"
+        generalized = self._strong_resource_generalized(entity, resource_candidates)
+        if resource_record is not None and len(generalized) >= 2:
+            return "resource_hit"
+        if len(generalized) >= 1:
+            return "resource_hit"
+        if resource_record is not None or resource_candidates:
+            return "resource_weak"
+        return "resource_miss"
+
+    def _strong_resource_generalized(self, entity: ExtractedEntity, resource_candidates: list[str]) -> list[str]:
+        strong = []
+        for candidate in resource_candidates:
+            lowered = normalize_entity_text(candidate).lower()
+            if self._candidate_level(entity, candidate) != "generalized":
+                continue
+            if entity.label == "DISEASE" and lowered.endswith((" condition", " disorder", " disease", " infection", " syndrome")):
+                strong.append(candidate)
+            elif entity.label == "DRUG" and lowered.endswith((" medication", " medicine", " treatment", " therapy", " drug")):
+                strong.append(candidate)
+        return strong
+
+    def _resource_family_hints(
+        self,
+        entity: ExtractedEntity,
+        resource_record: Optional[ResourceTerm],
+    ) -> list[str]:
+        hints: list[str] = []
+        tag_to_family = {
+            "dermatology": "dermatologic",
+            "hair": "dermatologic",
+            "neurology": "neurological",
+            "vascular": "circulatory",
+            "hematology": "circulatory",
+            "adrenal": "endocrine",
+            "endocrine": "endocrine",
+            "thyroid": "endocrine",
+            "psychiatric": "mental_health",
+            "psychiatry": "mental_health",
+            "mental health": "mental_health",
+            "gastrointestinal": "digestive",
+            "hepatic": "hepatic",
+            "urinary": "urinary",
+            "pulmonary": "respiratory",
+            "respiratory": "respiratory",
+            "oncology": "oncology",
+            "pain": "musculoskeletal",
+        }
+        if resource_record is not None:
+            hints.extend([tag for tag in getattr(resource_record, "normalized_tags", ()) if tag])
+            hints.extend([tag for tag in getattr(resource_record, "tags", ()) if tag])
+        lowered = entity.normalized_text.lower()
+        lexical_map = {
+            "skin": "dermatologic",
+            "scalp": "dermatologic",
+            "thyroid": "endocrine",
+            "horm": "endocrine",
+            "neuro": "neurological",
+            "seiz": "neurological",
+            "pain": "pain",
+            "heart": "circulatory",
+            "vascular": "circulatory",
+            "lung": "respiratory",
+            "bronch": "respiratory",
+            "stomach": "digestive",
+            "gastro": "digestive",
+            "liver": "hepatic",
+            "urinary": "urinary",
+            "bladder": "urinary",
+            "infect": "infectious",
+            "bacter": "infectious",
+            "anxiety": "mental_health",
+            "depress": "mental_health",
+            "anti inflammatory": "anti_inflammatory",
+        }
+        for needle, family in lexical_map.items():
+            if needle in lowered and family not in hints:
+                hints.append(family)
+        seen = set()
+        ordered = []
+        for hint in hints:
+            key = normalize_entity_text(tag_to_family.get(normalize_entity_text(hint).lower(), hint))
+            if key and key not in seen:
+                seen.add(key)
+                ordered.append(hint)
+        return [tag_to_family.get(normalize_entity_text(hint).lower(), normalize_entity_text(hint)) for hint in ordered[:4]]
+
+    def _family_template_candidates(self, entity: ExtractedEntity, normalized: str, family_hints: list[str]) -> list[str]:
+        templates = self.resource_registry.get_family_templates_for_record(entity.label, normalized)
+        family_map = self.resource_registry.family_templates.get(entity.label, {}) if isinstance(self.resource_registry.family_templates, dict) else {}
+        for hint in family_hints:
+            key = normalize_entity_text(hint).lower()
+            for candidate in family_map.get(key, []):
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate and normalized_candidate not in templates:
+                    templates.append(normalized_candidate)
+        return templates
 
     def _generate_numeric_candidates(self, entity: ExtractedEntity) -> list[str]:
         text = entity.normalized_text
@@ -1343,6 +1619,8 @@ class CandidateGenerator:
         original_tokens = entity.normalized_text.split()
         candidate_tokens = candidate.split()
         if entity.category == "categorical":
+            if entity.label in {"DISEASE", "DRUG"} and candidate_source == "llm_completion":
+                return self._passes_llm_generalized_guard(entity, candidate)
             if abs(len(candidate_tokens) - len(original_tokens)) > 1:
                 return False
             if entity.label == "DISEASE":
@@ -1461,9 +1739,44 @@ class CandidateGenerator:
     ) -> str:
         if self._passes_llm_generalized_guard(entity, candidate):
             return "generalized"
-        return preferred_level
+        return "related"
 
     def _resource_pool_candidates(self, entity: ExtractedEntity) -> list[str]:
+        if entity.label in {"DISEASE", "DRUG"}:
+            record = self.resource_registry.find_record(entity.label, entity.normalized_text)
+            candidates: list[str] = []
+            source_map: dict[str, str] = {}
+            level_map: dict[str, str] = {}
+            if record is not None:
+                for candidate in [record.term, *record.aliases, *record.generalized]:
+                    normalized_candidate = normalize_entity_text(candidate)
+                    if not normalized_candidate or normalized_candidate in candidates:
+                        continue
+                    candidates.append(normalized_candidate)
+                    if normalized_candidate.lower() == record.normalized_term:
+                        source_map[normalized_candidate] = "record"
+                        level_map[normalized_candidate] = "canonical"
+                    elif normalized_candidate.lower() in record.normalized_aliases:
+                        source_map[normalized_candidate] = "record"
+                        level_map[normalized_candidate] = "alias"
+                    elif normalized_candidate.lower() in record.normalized_generalized:
+                        source_map[normalized_candidate] = "record"
+                        level_map[normalized_candidate] = "generalized"
+                    else:
+                        source_map[normalized_candidate] = "record"
+                        level_map[normalized_candidate] = "global"
+            self._attach_candidate_sources(
+                entity,
+                candidates,
+                source_map,
+                default_source="record",
+                level_map=level_map,
+                default_level="global",
+            )
+            trace = dict(entity.candidate_trace or {})
+            trace["record_hit"] = record is not None
+            entity.candidate_trace = trace
+            return candidates
         candidates, trace = self.typed_index.merge_and_filter(entity, return_trace=True)
         entity.candidate_trace = {
             "category": trace.category,
@@ -1539,22 +1852,7 @@ class CandidateGenerator:
         if len(generalized) >= minimum:
             return self._retain_attack_candidates(entity, candidates)
         original = entity.normalized_text
-        completed = list(candidates)
-        completion = self.llm_completion.complete(original, entity.label) if self.llm_completion is not None else None
-        if completion is not None:
-            for candidate in completion.generalized:
-                normalized_candidate = normalize_entity_text(candidate)
-                if normalized_candidate and normalized_candidate not in completed and self._is_candidate_compatible(entity, normalized_candidate):
-                    completed.append(normalized_candidate)
-                    trace = dict(entity.candidate_trace or {})
-                    candidate_sources = dict(trace.get("candidate_sources") or {})
-                    candidate_levels = dict(trace.get("candidate_levels") or trace.get("candidate_layers") or {})
-                    candidate_sources[normalized_candidate] = "llm_completion"
-                    candidate_levels[normalized_candidate] = "generalized"
-                    trace["candidate_sources"] = candidate_sources
-                    trace["candidate_levels"] = candidate_levels
-                    entity.candidate_trace = trace
-        completed = self._dedupe_candidates(completed, original)
+        completed = self._dedupe_candidates(list(candidates), original)
         generalized = [candidate for candidate in completed if self._candidate_level(entity, candidate) == "generalized"]
         if len(generalized) < minimum:
             return self._retain_attack_candidates(entity, completed)
@@ -1562,6 +1860,31 @@ class CandidateGenerator:
         capped_tail = non_generalized[: max(self.top_k - (1 + len(generalized)), 0)]
         narrowed = self._dedupe_candidates([original, *generalized, *capped_tail], original)
         return self._retain_attack_candidates(entity, narrowed)
+
+    def _apply_llm_generalized_rerank(self, entity: ExtractedEntity, candidates: list[str]) -> list[str]:
+        if entity.label not in {"DISEASE", "DRUG"} or self.llm_completion is None:
+            return candidates
+        original = entity.normalized_text
+        generalized = [
+            candidate
+            for candidate in candidates
+            if candidate != original and self._candidate_level(entity, candidate) == "generalized"
+        ]
+        if len(generalized) < 2:
+            return candidates
+        preferred = self.llm_completion.rerank_candidates(original, entity.label, generalized)
+        if not preferred:
+            return candidates
+        trace = dict(entity.candidate_trace or {})
+        trace["llm_rerank_preferred"] = list(preferred)
+        entity.candidate_trace = trace
+        remaining_generalized = [candidate for candidate in generalized if candidate not in preferred]
+        tail = [
+            candidate
+            for candidate in candidates
+            if candidate != original and self._candidate_level(entity, candidate) != "generalized"
+        ]
+        return self._dedupe_candidates([original, *preferred, *remaining_generalized, *tail], original)
 
     def _retain_attack_candidates(self, entity: ExtractedEntity, candidates: list[str]) -> list[str]:
         if entity.label not in {"DISEASE", "DRUG"}:
@@ -1689,14 +2012,30 @@ class CandidateGenerator:
             return [entity.normalized_text]
         original = entity.normalized_text
         original_record = self.resource_registry.find_record(entity.label, original)
+        trace = entity.candidate_trace or {}
+        candidate_sources = trace.get("candidate_sources", {}) or {}
+        candidate_levels = trace.get("candidate_levels", {}) or trace.get("candidate_layers", {}) or {}
+        family_hints = trace.get("resource_family_hints", []) or []
         guarded = [original]
         min_similarity = 0.68 if entity.label == "DISEASE" else 0.72
         for candidate in candidates:
             if candidate == original:
                 continue
+            normalized_candidate = normalize_entity_text(candidate)
+            candidate_source = candidate_sources.get(normalized_candidate, candidate_sources.get(candidate, "global"))
+            candidate_level = candidate_levels.get(normalized_candidate, candidate_levels.get(candidate, "unknown"))
             candidate_record = self.resource_registry.find_record(entity.label, candidate)
             is_generalized = self.resource_registry.is_generalized_candidate(entity.label, original, candidate)
-            if not self.medical_typer.candidate_group_matches(original, candidate, entity.label):
+            llm_like_generalized = (
+                candidate_level == "generalized"
+                and candidate_source in {"llm_completion", "family_template", "fallback"}
+            )
+            generalized_hint_ok = False
+            if llm_like_generalized:
+                generalized_hint_ok = self._passes_llm_generalized_guard(entity, candidate) or self._family_hint_allows_candidate(
+                    entity, candidate, family_hints
+                )
+            if not generalized_hint_ok and not self.medical_typer.candidate_group_matches(original, candidate, entity.label):
                 continue
             if original_record is not None:
                 original_tags = set(original_record.normalized_tags)
@@ -1707,15 +2046,54 @@ class CandidateGenerator:
             lexical = SequenceMatcher(None, original.lower(), candidate.lower()).ratio()
             tag_bonus = self._tag_bonus(entity.label, original, candidate)
             overlap = self._token_overlap(original, candidate)
-            local_min_similarity = 0.45 if is_generalized and entity.label == "DISEASE" else min_similarity
-            if original_record is not None and candidate_record is None and semantic < local_min_similarity and overlap < 0.5:
+            if generalized_hint_ok:
+                local_min_similarity = 0.22 if entity.label == "DISEASE" else 0.28
+            else:
+                local_min_similarity = 0.45 if is_generalized and entity.label == "DISEASE" else min_similarity
+            if (
+                not generalized_hint_ok
+                and original_record is not None
+                and candidate_record is None
+                and semantic < local_min_similarity
+                and overlap < 0.5
+            ):
                 continue
-            if semantic < local_min_similarity and lexical < 0.35 and tag_bonus <= 0:
+            if not generalized_hint_ok and semantic < local_min_similarity and lexical < 0.35 and tag_bonus <= 0:
                 continue
             guarded.append(candidate)
         if len(guarded) == 1:
             return guarded
         return self._dedupe_candidates(guarded, original)
+
+    def _family_hint_allows_candidate(self, entity: ExtractedEntity, candidate: str, family_hints: list[str]) -> bool:
+        if entity.label not in {"DISEASE", "DRUG"}:
+            return False
+        lowered = candidate.lower()
+        family_keywords = {
+            "dermatologic": ("skin", "dermatologic", "scalp", "hair"),
+            "endocrine": ("endocrine", "hormonal", "thyroid"),
+            "neurological": ("neurolog", "nerve", "cranial", "seizure", "epile"),
+            "infectious": ("infect", "bacterial", "viral", "sexually transmitted", "urogenital"),
+            "sexual_health": ("sexually transmitted", "urogenital", "reproductive"),
+            "digestive": ("digestive", "gastro", "stomach", "intestinal"),
+            "hepatic": ("hepatic", "liver"),
+            "circulatory": ("circulatory", "vascular", "cardio"),
+            "respiratory": ("respiratory", "lung", "pulmonary"),
+            "mental_health": ("mental health", "psychiatric", "mood"),
+            "musculoskeletal": ("musculoskeletal", "joint", "bone"),
+            "pain": ("pain", "analgesic", "symptom relief"),
+            "pain_relief": ("pain", "analgesic", "symptom relief"),
+            "anti-inflammatory": ("anti inflammatory", "anti-inflammatory", "inflammation"),
+            "anti_inflammatory": ("anti inflammatory", "anti-inflammatory", "inflammation"),
+            "steroid": ("steroid", "corticosteroid"),
+            "antiepileptic": ("seizure", "antiepileptic", "epilepsy", "neurological"),
+            "oncology": ("cancer", "oncolog", "tumor"),
+        }
+        for hint in family_hints or []:
+            for token in family_keywords.get(normalize_entity_text(hint).lower(), ()):
+                if token in lowered:
+                    return True
+        return False
 
     def _medical_fallback_candidates(self, entity: ExtractedEntity) -> list[str]:
         lowered = entity.normalized_text.lower()
@@ -1959,6 +2337,17 @@ class MechanismFactory:
         level = self.candidate_generator._candidate_level(entity, candidate)
         score = 0.68 * semantic_sim + 0.06 * surface_sim + 0.06 * overlap + 0.08 * type_bonus
         score += self.candidate_generator._candidate_level_prior(entity, candidate, level, risk)
+        trace = entity.candidate_trace or {}
+        llm_preferred = {
+            normalize_entity_text(item)
+            for item in (trace.get("llm_rerank_preferred") or [])
+            if normalize_entity_text(item)
+        }
+        normalized_candidate = normalize_entity_text(candidate)
+        if normalized_candidate in llm_preferred and label in {"DISEASE", "DRUG"}:
+            score += 0.28 if label == "DISEASE" else 0.20
+        elif llm_preferred and level == "generalized" and normalized_candidate not in llm_preferred and label in {"DISEASE", "DRUG"}:
+            score -= 0.10 if label == "DISEASE" else 0.06
         if candidate == original:
             score -= 1.00 if label in {"DISEASE", "DRUG"} else 0.25
         elif surface_sim >= 0.94 or overlap >= 0.90:

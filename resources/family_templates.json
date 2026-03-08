@@ -1,0 +1,111 @@
+{
+  "schema_version": "typed_resource_v2",
+  "generated_at_utc": "2026-03-07T16:10:54.435825+00:00",
+  "builder_version": "2.1.0",
+  "templates": {
+    "DISEASE": {
+      "dermatologic": [
+        "skin condition",
+        "dermatologic disorder"
+      ],
+      "endocrine": [
+        "endocrine disorder",
+        "hormonal condition"
+      ],
+      "neurological": [
+        "neurological condition",
+        "nerve disorder"
+      ],
+      "respiratory": [
+        "respiratory condition",
+        "lung disorder"
+      ],
+      "digestive": [
+        "digestive disorder",
+        "gastrointestinal condition"
+      ],
+      "circulatory": [
+        "circulatory disorder",
+        "vascular condition"
+      ],
+      "infectious": [
+        "infectious disease",
+        "bacterial infection"
+      ],
+      "autoimmune": [
+        "autoimmune disorder",
+        "immune condition"
+      ],
+      "mental_health": [
+        "mental health condition",
+        "psychiatric disorder"
+      ],
+      "musculoskeletal": [
+        "musculoskeletal disorder",
+        "joint condition"
+      ],
+      "urinary": [
+        "urinary condition",
+        "urinary disorder"
+      ],
+      "hepatic": [
+        "liver disorder",
+        "hepatic condition"
+      ],
+      "oncology": [
+        "cancer condition",
+        "medical condition"
+      ],
+      "general_medical": [
+        "medical condition",
+        "health disorder"
+      ]
+    },
+    "DRUG": {
+      "pain_relief": [
+        "pain medication",
+        "symptom relief medication"
+      ],
+      "endocrine": [
+        "hormone medication",
+        "endocrine treatment"
+      ],
+      "neurological": [
+        "neurological medication",
+        "nerve treatment"
+      ],
+      "psychiatric": [
+        "psychiatric medication",
+        "mental health treatment"
+      ],
+      "anti_inflammatory": [
+        "anti inflammatory medication",
+        "anti inflammatory treatment"
+      ],
+      "anti_infective": [
+        "anti infective medication",
+        "infection treatment"
+      ],
+      "cardiovascular": [
+        "cardiovascular medication",
+        "heart treatment"
+      ],
+      "respiratory": [
+        "respiratory medication",
+        "breathing treatment"
+      ],
+      "gastrointestinal": [
+        "digestive medication",
+        "gastrointestinal treatment"
+      ],
+      "dermatologic": [
+        "skin medication",
+        "dermatologic treatment"
+      ],
+      "general_therapy": [
+        "medical treatment",
+        "prescription medication"
+      ]
+    }
+  }
+}

@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
 
-BUILDER_VERSION = "1.0.0"
-SCHEMA_VERSION = "typed_resource_v1"
+BUILDER_VERSION = "2.1.0"
+SCHEMA_VERSION = "typed_resource_v2"
 RELATED_TOP_K = 3
 RELATED_MIN_SCORE = 0.18
 
@@ -53,6 +53,76 @@ DRUG_GENERALIZATION_MAP = {
     "methylprednisolone": ["steroid medication", "anti inflammatory medication"],
 }
 
+FAMILY_TEMPLATES = {
+    "DISEASE": {
+        "dermatologic": ["skin condition", "dermatologic disorder"],
+        "endocrine": ["endocrine disorder", "hormonal condition"],
+        "neurological": ["neurological condition", "nerve disorder"],
+        "respiratory": ["respiratory condition", "lung disorder"],
+        "digestive": ["digestive disorder", "gastrointestinal condition"],
+        "circulatory": ["circulatory disorder", "vascular condition"],
+        "infectious": ["infectious disease", "bacterial infection"],
+        "autoimmune": ["autoimmune disorder", "immune condition"],
+        "mental_health": ["mental health condition", "psychiatric disorder"],
+        "musculoskeletal": ["musculoskeletal disorder", "joint condition"],
+        "urinary": ["urinary condition", "urinary disorder"],
+        "hepatic": ["liver disorder", "hepatic condition"],
+        "oncology": ["cancer condition", "medical condition"],
+        "general_medical": ["medical condition", "health disorder"],
+    },
+    "DRUG": {
+        "pain_relief": ["pain medication", "symptom relief medication"],
+        "endocrine": ["hormone medication", "endocrine treatment"],
+        "neurological": ["neurological medication", "nerve treatment"],
+        "psychiatric": ["psychiatric medication", "mental health treatment"],
+        "anti_inflammatory": ["anti inflammatory medication", "anti inflammatory treatment"],
+        "anti_infective": ["anti infective medication", "infection treatment"],
+        "cardiovascular": ["cardiovascular medication", "heart treatment"],
+        "respiratory": ["respiratory medication", "breathing treatment"],
+        "gastrointestinal": ["digestive medication", "gastrointestinal treatment"],
+        "dermatologic": ["skin medication", "dermatologic treatment"],
+        "general_therapy": ["medical treatment", "prescription medication"],
+    },
+}
+
+DISEASE_FAMILY_HINTS = {
+    "oncology": "oncology",
+    "thyroid": "endocrine",
+    "endocrine": "endocrine",
+    "dermatology": "dermatologic",
+    "hair": "dermatologic",
+    "infectious": "infectious",
+    "sexual_health": "infectious",
+    "neurology": "neurological",
+    "pain": "musculoskeletal",
+    "vascular": "circulatory",
+    "hematology": "circulatory",
+    "gastrointestinal": "digestive",
+    "hepatic": "hepatic",
+    "psychiatric": "mental_health",
+    "pulmonary": "respiratory",
+    "autoimmune": "autoimmune",
+}
+
+DRUG_FAMILY_HINTS = {
+    "ssri": "psychiatric",
+    "psychiatric": "psychiatric",
+    "oncology": "general_therapy",
+    "tki": "general_therapy",
+    "antibiotic": "anti_infective",
+    "antifungal": "anti_infective",
+    "dermatology": "dermatologic",
+    "antidiabetic": "endocrine",
+    "endocrine": "endocrine",
+    "analgesic": "pain_relief",
+    "pain": "pain_relief",
+    "steroid": "anti_inflammatory",
+    "anti-inflammatory": "anti_inflammatory",
+    "neurology": "neurological",
+    "antiepileptic": "neurological",
+    "thyroid": "endocrine",
+}
+
 
 def normalize_text(text: str) -> str:
     text = str(text).strip()
@@ -92,7 +162,119 @@ def _load_jsonl_records(path: str) -> list[dict | str]:
     return items
 
 
-def load_seed_records(path: str) -> list[dict | str]:
+def _parse_obo_synonym(line: str) -> str:
+    match = re.search(r'"([^"]+)"', line)
+    return normalize_text(match.group(1)) if match else ""
+
+
+def _load_doid_obo_records(path: str) -> list[dict]:
+    items: list[dict] = []
+    current: dict | None = None
+    in_term = False
+
+    def flush_current() -> None:
+        nonlocal current
+        if not current:
+            return
+        if current.get("is_obsolete"):
+            current = None
+            return
+        term = normalize_text(current.get("term", ""))
+        if not term:
+            current = None
+            return
+        aliases = []
+        seen_aliases = set()
+        for alias in current.get("aliases", []):
+            norm = normalize_text(alias)
+            lowered = norm.lower()
+            if norm and lowered != term.lower() and lowered not in seen_aliases:
+                seen_aliases.add(lowered)
+                aliases.append(norm)
+        tags = normalize_tags(current.get("tags", []))
+        item = {
+            "canonical_id": normalize_text(current.get("canonical_id", "")),
+            "term": term,
+            "aliases": aliases,
+            "related": [],
+            "generalized": [],
+            "family": [],
+            "tags": tags,
+        }
+        items.append(item)
+        current = None
+
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                if in_term:
+                    flush_current()
+                    in_term = False
+                continue
+
+            if line == "[Term]":
+                if in_term:
+                    flush_current()
+                current = {"aliases": [], "tags": []}
+                in_term = True
+                continue
+
+            if line.startswith("["):
+                if in_term:
+                    flush_current()
+                    in_term = False
+                continue
+
+            if not in_term or current is None:
+                continue
+
+            if line.startswith("id:"):
+                current["canonical_id"] = normalize_text(line.split(":", 1)[1])
+            elif line.startswith("name:"):
+                current["term"] = normalize_text(line.split(":", 1)[1])
+            elif line.startswith("synonym:"):
+                synonym = _parse_obo_synonym(line)
+                if synonym:
+                    current.setdefault("aliases", []).append(synonym)
+            elif line.startswith("is_a:"):
+                parent = normalize_text(line.split("!", 1)[-1] if "!" in line else line.split(":", 1)[1])
+                if parent:
+                    current.setdefault("tags", []).append(parent)
+            elif line.startswith("subset:"):
+                subset = normalize_text(line.split(":", 1)[1])
+                if subset:
+                    current.setdefault("tags", []).append(subset)
+            elif line.startswith("namespace:"):
+                namespace = normalize_text(line.split(":", 1)[1])
+                if namespace:
+                    current.setdefault("tags", []).append(namespace)
+            elif line.startswith("is_obsolete:"):
+                current["is_obsolete"] = line.endswith("true")
+
+    if in_term:
+        flush_current()
+
+    return items
+
+
+def infer_source_format(path: str, explicit_format: str | None = None) -> str:
+    if explicit_format and explicit_format != "auto":
+        return explicit_format
+    lowered = path.lower()
+    if lowered.endswith(".jsonl"):
+        return "jsonl"
+    if lowered.endswith(".json"):
+        return "json"
+    if lowered.endswith(".obo"):
+        return "doid_obo"
+    raise ValueError(f"Unable to infer source format from path: {path}")
+
+
+def load_seed_records(path: str, source_format: str = "auto") -> list[dict | str]:
+    resolved_format = infer_source_format(path, source_format)
+    if resolved_format == "doid_obo":
+        return _load_doid_obo_records(path)
     if path.lower().endswith(".jsonl"):
         return _load_jsonl_records(path)
 
@@ -149,12 +331,14 @@ def normalize_record(item: dict | str, prefix: str) -> dict | None:
         if norm and norm.lower() != term.lower() and norm not in generalized:
             generalized.append(norm)
     tags = normalize_tags(item.get("tags", []))
+    family = normalize_tags(item.get("family", []))
     canonical_id = normalize_text(item.get("canonical_id", "")) or f"{prefix}:{slugify(term)}"
     return {
         "term": term,
         "aliases": aliases,
         "related": related,
         "generalized": generalized,
+        "family": family,
         "tags": tags,
         "canonical_id": canonical_id,
     }
@@ -179,32 +363,84 @@ def _lookup_seeded_generalizations(term_lower: str, aliases: list[str], mapping:
     return values
 
 
-def build_disease_generalized(term: str, aliases: list[str], tags: list[str]) -> list[str]:
+def _merge_families(families: list[str]) -> list[str]:
+    out = []
+    seen = set()
+    for family in families:
+        norm = normalize_text(family).lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def infer_families(prefix: str, term: str, aliases: list[str], tags: list[str], existing_family: list[str]) -> list[str]:
+    term_lower = normalize_text(term).lower()
+    families = list(existing_family or [])
+    tag_map = DISEASE_FAMILY_HINTS if prefix == "disease" else DRUG_FAMILY_HINTS
+    lexical_rules = {
+        "disease": {
+            "cancer": "oncology",
+            "alopecia": "dermatologic",
+            "psoriasis": "dermatologic",
+            "dermatitis": "dermatologic",
+            "gonorr": "infectious",
+            "infection": "infectious",
+            "hepat": "hepatic",
+            "gastr": "digestive",
+            "bronch": "respiratory",
+            "lung": "respiratory",
+            "heart": "circulatory",
+            "vascular": "circulatory",
+            "thyroid": "endocrine",
+            "graves": "endocrine",
+            "hyperthy": "endocrine",
+            "anxiety": "mental_health",
+            "depression": "mental_health",
+            "neuralgia": "neurological",
+            "dvt": "circulatory",
+            "arthritis": "musculoskeletal",
+        },
+        "drug": {
+            "ibuprofen": "pain_relief",
+            "aspirin": "pain_relief",
+            "acetaminophen": "pain_relief",
+            "paracetamol": "pain_relief",
+            "predni": "anti_inflammatory",
+            "methylpred": "anti_inflammatory",
+            "euthyrox": "endocrine",
+            "thyrox": "endocrine",
+            "levothyrox": "endocrine",
+            "trileptal": "neurological",
+            "oxcarbazepine": "neurological",
+            "pregabalin": "neurological",
+            "gabapentin": "neurological",
+            "sertraline": "psychiatric",
+            "fluoxetine": "psychiatric",
+            "escitalopram": "psychiatric",
+            "cillin": "anti_infective",
+            "azole": "anti_infective",
+        },
+    }
+    for tag in tags:
+        family = tag_map.get(tag)
+        if family:
+            families.append(family)
+    for needle, family in lexical_rules[prefix].items():
+        if needle in term_lower or any(needle in normalize_text(alias).lower() for alias in aliases):
+            families.append(family)
+    if not families:
+        families.append("general_medical" if prefix == "disease" else "general_therapy")
+    return _merge_families(families)
+
+
+def build_disease_generalized(term: str, aliases: list[str], tags: list[str], family: list[str]) -> list[str]:
     term_lower = normalize_text(term).lower()
     generalized = []
-
-    tag_templates = {
-        "oncology": "cancer condition",
-        "thyroid": "thyroid disorder",
-        "endocrine": "endocrine disorder",
-        "dermatology": "skin condition",
-        "hair": "hair loss condition",
-        "infectious": "infectious condition",
-        "sexual_health": "sexually transmitted infection",
-        "neurology": "neurological condition",
-        "pain": "pain disorder",
-        "vascular": "vascular condition",
-        "hematology": "blood disorder",
-        "gastrointestinal": "gastrointestinal condition",
-        "hepatic": "liver condition",
-        "psychiatric": "mental health condition",
-        "pulmonary": "respiratory condition",
-    }
-
-    for tag in tags:
-        candidate = tag_templates.get(tag)
-        if candidate and candidate not in generalized:
-            generalized.append(candidate)
+    for family_name in family:
+        for candidate in FAMILY_TEMPLATES["DISEASE"].get(family_name, []):
+            if candidate not in generalized:
+                generalized.append(candidate)
 
     generalized.extend(_lookup_seeded_generalizations(term_lower, aliases, DISEASE_GENERALIZATION_MAP))
 
@@ -229,33 +465,13 @@ def build_disease_generalized(term: str, aliases: list[str], tags: list[str]) ->
     return _merge_unique(generalized, term_lower)
 
 
-def build_drug_generalized(term: str, aliases: list[str], tags: list[str]) -> list[str]:
+def build_drug_generalized(term: str, aliases: list[str], tags: list[str], family: list[str]) -> list[str]:
     term_lower = normalize_text(term).lower()
     generalized = []
-
-    tag_templates = {
-        "ssri": "antidepressant medication",
-        "psychiatric": "psychiatric medication",
-        "oncology": "oncology medication",
-        "tki": "targeted cancer therapy",
-        "antibiotic": "antibiotic medication",
-        "antifungal": "antifungal medication",
-        "dermatology": "skin treatment",
-        "antidiabetic": "diabetes medication",
-        "endocrine": "hormone or endocrine medication",
-        "analgesic": "pain medication",
-        "pain": "pain medication",
-        "steroid": "steroid medication",
-        "anti-inflammatory": "anti inflammatory medication",
-        "neurology": "neurological medication",
-        "antiepileptic": "antiepileptic medication",
-        "thyroid": "thyroid medication",
-    }
-
-    for tag in tags:
-        candidate = tag_templates.get(tag)
-        if candidate and candidate not in generalized:
-            generalized.append(candidate)
+    for family_name in family:
+        for candidate in FAMILY_TEMPLATES["DRUG"].get(family_name, []):
+            if candidate not in generalized:
+                generalized.append(candidate)
 
     generalized.extend(_lookup_seeded_generalizations(term_lower, aliases, DRUG_GENERALIZATION_MAP))
 
@@ -330,6 +546,7 @@ def dedupe_records(records: list[dict]) -> tuple[list[dict], dict]:
         existing["aliases"] = _merge_unique_list(existing.get("aliases", []), record.get("aliases", []), existing["term"])
         existing["related"] = _merge_unique_list(existing.get("related", []), record.get("related", []), existing["term"])
         existing["generalized"] = _merge_unique_list(existing.get("generalized", []), record.get("generalized", []), existing["term"])
+        existing["family"] = _merge_unique_list(existing.get("family", []), record.get("family", []), existing["term"])
         existing_tags = list(existing.get("tags", []))
         for tag in record.get("tags", []):
             tag_norm = normalize_text(tag).lower()
@@ -359,12 +576,26 @@ def export_index(records: list[dict], output_path: str, metadata: dict) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build typed public resource indices for DenPAD.")
     parser.add_argument("--disease_source", type=str, help="Seed JSON or JSONL-compatible disease source.")
+    parser.add_argument(
+        "--disease_source_format",
+        type=str,
+        default="auto",
+        choices=["auto", "json", "jsonl", "doid_obo"],
+        help="Disease source format. Use doid_obo for Disease Ontology .obo files.",
+    )
     parser.add_argument("--disease_output", type=str, help="Output JSON path for the disease typed index.")
     parser.add_argument("--disease_source_name", type=str, default="unspecified", help="Human-readable source name for disease provenance.")
     parser.add_argument("--disease_source_url", type=str, default="", help="Source URL for disease provenance.")
     parser.add_argument("--disease_source_license", type=str, default="", help="Source license for disease provenance.")
     parser.add_argument("--disease_source_version", type=str, default="", help="Source version/date for disease provenance.")
     parser.add_argument("--drug_source", type=str, help="Seed JSON or JSONL-compatible drug source.")
+    parser.add_argument(
+        "--drug_source_format",
+        type=str,
+        default="auto",
+        choices=["auto", "json", "jsonl"],
+        help="Drug source format.",
+    )
     parser.add_argument("--drug_output", type=str, help="Output JSON path for the drug typed index.")
     parser.add_argument("--drug_source_name", type=str, default="unspecified", help="Human-readable source name for drug provenance.")
     parser.add_argument("--drug_source_url", type=str, default="", help="Source URL for drug provenance.")
@@ -375,6 +606,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional output path for typed resource manifest. Defaults to <output_dir>/typed_resource_manifest.json.",
+    )
+    parser.add_argument(
+        "--family_templates_output",
+        type=str,
+        default=None,
+        help="Optional output path for family template JSON. Defaults to <output_dir>/family_templates.json.",
     )
     return parser.parse_args()
 
@@ -392,9 +629,11 @@ def build_index(
     source_path: str,
     output_path: str,
     prefix: str,
+    source_format: str = "auto",
     source_metadata: dict | None = None,
 ) -> dict:
-    seed_items = load_seed_records(source_path)
+    resolved_format = infer_source_format(source_path, source_format)
+    seed_items = load_seed_records(source_path, source_format=resolved_format)
     raw_records = []
     dropped_empty = 0
     for item in seed_items:
@@ -406,23 +645,32 @@ def build_index(
 
     records, dedupe_stats = dedupe_records(raw_records)
     generalized_generated = 0
+    family_generated = 0
     for record in records:
+        if not record.get("family"):
+            record["family"] = infer_families(prefix, record["term"], record["aliases"], record["tags"], record.get("family", []))
+            if record["family"]:
+                family_generated += 1
         if not record["generalized"]:
             if prefix == "disease":
                 record["generalized"] = build_disease_generalized(
-                    record["term"], record["aliases"], record["tags"]
+                    record["term"], record["aliases"], record["tags"], record["family"]
                 )
             else:
                 record["generalized"] = build_drug_generalized(
-                    record["term"], record["aliases"], record["tags"]
+                    record["term"], record["aliases"], record["tags"], record["family"]
                 )
             if record["generalized"]:
                 generalized_generated += 1
 
-    related_missing_before = sum(1 for record in records if not record.get("related"))
-    records = build_related(records, top_k=RELATED_TOP_K, min_score=RELATED_MIN_SCORE)
-    related_filled = sum(1 for record in records if record.get("related")) - (len(records) - related_missing_before)
-    related_filled = max(0, related_filled)
+    skip_related_builder = resolved_format == "doid_obo"
+    if skip_related_builder:
+        related_filled = 0
+    else:
+        related_missing_before = sum(1 for record in records if not record.get("related"))
+        records = build_related(records, top_k=RELATED_TOP_K, min_score=RELATED_MIN_SCORE)
+        related_filled = sum(1 for record in records if record.get("related")) - (len(records) - related_missing_before)
+        related_filled = max(0, related_filled)
 
     source_sha = sha256_file(source_path)
     metadata = {
@@ -439,6 +687,7 @@ def build_index(
             "dropped_empty": dropped_empty,
             "normalized_records": dedupe_stats["normalized_records"],
             "duplicates_merged": dedupe_stats["duplicates_merged"],
+            "family_generated": family_generated,
             "generalized_generated": generalized_generated,
             "related_filled": related_filled,
         },
@@ -452,6 +701,7 @@ def build_index(
             "min_score": RELATED_MIN_SCORE,
             "lexical_weight": 0.35,
             "tag_overlap_weight": 0.65,
+            "skipped": skip_related_builder,
         },
     }
     export_index(records, output_path, metadata)
@@ -464,9 +714,25 @@ def build_index(
         "source_path": source_path,
         "source_sha256": source_sha,
         "source_item_count": len(seed_items),
+        "source_format": resolved_format,
         "source_metadata": source_metadata or {},
         "build_stats": metadata["build_stats"],
     }
+
+
+def write_family_templates(output_path: str) -> None:
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "builder_version": BUILDER_VERSION,
+        "templates": FAMILY_TEMPLATES,
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
 
 
 def write_manifest(manifest_path: str, entries: list[dict]) -> None:
@@ -496,6 +762,14 @@ def _default_manifest_path(args: argparse.Namespace) -> str:
     return os.path.join(base_dir, "typed_resource_manifest.json")
 
 
+def _default_family_templates_path(args: argparse.Namespace) -> str:
+    if args.family_templates_output:
+        return args.family_templates_output
+    out_paths = [p for p in (args.disease_output, args.drug_output) if p]
+    base_dir = os.path.dirname(out_paths[0]) if out_paths else os.getcwd()
+    return os.path.join(base_dir, "family_templates.json")
+
+
 def main() -> None:
     args = parse_args()
     if not any([args.disease_source, args.drug_source]):
@@ -512,6 +786,7 @@ def main() -> None:
             args.disease_source,
             args.disease_output,
             prefix="disease",
+            source_format=args.disease_source_format,
             source_metadata=source_metadata_from_args(args, "disease"),
         )
         entries.append(result)
@@ -521,6 +796,7 @@ def main() -> None:
             args.drug_source,
             args.drug_output,
             prefix="drug",
+            source_format=args.drug_source_format,
             source_metadata=source_metadata_from_args(args, "drug"),
         )
         entries.append(result)
@@ -529,6 +805,9 @@ def main() -> None:
     manifest_path = _default_manifest_path(args)
     write_manifest(manifest_path, entries)
     print(f"Wrote typed resource manifest to {manifest_path}")
+    family_templates_path = _default_family_templates_path(args)
+    write_family_templates(family_templates_path)
+    print(f"Wrote family templates to {family_templates_path}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -22,13 +21,27 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).strip())
 
 
+def _normalize_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
 @dataclass(frozen=True)
-class CompletionResult:
-    generalized: list[str]
-    safe_related: list[str]
+class GeneratedCandidateResult:
+    generated: list[str]
+    raw_output: str
+    parsed_output: list[str]
+
+
+@dataclass(frozen=True)
+class CritiquedCandidateResult:
+    approved: list[str]
+    raw_output: str
+    parsed_output: list[str]
 
 
 class CandidateLLMCompletion:
+    """Local deterministic generator/reranker for typed generalized candidates."""
+
     def __init__(
         self,
         model_name: Optional[str] = "Qwen/Qwen2.5-3B-Instruct",
@@ -46,11 +59,13 @@ class CandidateLLMCompletion:
         self.tokenizer = None
         self.model = None
         self.model_family = "seq2seq"
-        self.cache: dict[tuple[str, str], CompletionResult] = {}
+        self.rerank_cache: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+        self.generate_cache: dict[tuple[str, str, tuple[str, ...]], GeneratedCandidateResult] = {}
+        self.critique_cache: dict[tuple[str, str, tuple[str, ...], tuple[str, ...]], CritiquedCandidateResult] = {}
         if not self.enabled:
             return
         if AutoTokenizer is None or AutoConfig is None:
-            LOGGER.warning("transformers is unavailable; local candidate completion is disabled.")
+            LOGGER.warning("transformers is unavailable; local candidate reranker is disabled.")
             self.enabled = False
             return
         try:
@@ -78,46 +93,115 @@ class CandidateLLMCompletion:
             self.model.eval()
             self.device = resolved_device
         except Exception as exc:
-            LOGGER.warning("Failed to load local candidate completion model %s: %s", model_name, exc)
+            LOGGER.warning("Failed to load local candidate reranker model %s: %s", model_name, exc)
             self.enabled = False
             self.tokenizer = None
             self.model = None
 
-    def complete(self, entity: str, entity_type: str) -> CompletionResult:
-        normalized_entity = _normalize_text(entity)
-        key = (entity_type.upper(), normalized_entity.lower())
-        if key in self.cache:
-            return self.cache[key]
-        if not self.enabled or self.model is None or self.tokenizer is None:
-            result = CompletionResult(generalized=[], safe_related=[])
-            self.cache[key] = result
-            return result
+    def generate_candidates(
+        self,
+        entity: str,
+        entity_type: str,
+        family_hints: Optional[list[str]] = None,
+    ) -> list[str]:
+        return self.generate_candidates_debug(entity, entity_type, family_hints).generated
 
-        prompt = self._build_prompt(normalized_entity, entity_type.upper())
+    def generate_candidates_debug(
+        self,
+        entity: str,
+        entity_type: str,
+        family_hints: Optional[list[str]] = None,
+    ) -> GeneratedCandidateResult:
+        entity = _normalize_text(entity)
+        hints = [hint for hint in (family_hints or []) if hint]
+        key = (entity_type.upper(), entity.lower(), tuple(hints))
+        if key in self.generate_cache:
+            return self.generate_cache[key]
+        if not self.enabled or self.model is None or self.tokenizer is None:
+            result = GeneratedCandidateResult(generated=[], raw_output="", parsed_output=[])
+            self.generate_cache[key] = result
+            return result
+        prompt = self._build_generation_prompt(entity, entity_type.upper(), hints)
+        raw_output = ""
         try:
-            encoded_prompt = self._encode_prompt(prompt)
-            inputs = self.tokenizer(encoded_prompt, return_tensors="pt", truncation=True, max_length=384)
-            inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}
-            prompt_length = int(inputs["input_ids"].shape[-1])
-            with torch.no_grad():
-                output = self.model.generate(
-                    **inputs,
-                    do_sample=False,
-                    num_beams=1,
-                    max_new_tokens=self.max_new_tokens,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            if self.model_family == "causal":
-                generated_tokens = output[0][prompt_length:]
-                decoded = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            else:
-                decoded = self.tokenizer.decode(output[0], skip_special_tokens=True)
-            result = self._parse_output(decoded, normalized_entity)
+            raw_output = self._run_prompt(prompt, max_length=448)
+            parsed = self._parse_generated(raw_output)
         except Exception as exc:
-            LOGGER.warning("Local candidate completion failed for %s (%s): %s", normalized_entity, entity_type, exc)
-            result = CompletionResult(generalized=[], safe_related=[])
-        self.cache[key] = result
+            LOGGER.warning("Local candidate generation failed for %s (%s): %s", entity, entity_type, exc)
+            parsed = []
+        result = GeneratedCandidateResult(generated=list(parsed), raw_output=raw_output, parsed_output=list(parsed))
+        self.generate_cache[key] = result
+        return result
+
+    def rerank_candidates(self, entity: str, entity_type: str, candidates: list[str]) -> list[str]:
+        cleaned = self._clean_input_candidates(candidates)
+        if len(cleaned) < 2:
+            return cleaned
+        key = (entity_type.upper(), _normalize_text(entity).lower(), tuple(cleaned))
+        if key in self.rerank_cache:
+            return list(self.rerank_cache[key])
+        if not self.enabled or self.model is None or self.tokenizer is None:
+            self.rerank_cache[key] = list(cleaned)
+            return cleaned
+
+        prompt = self._build_rerank_prompt(_normalize_text(entity), entity_type.upper(), cleaned)
+        try:
+            decoded = self._run_prompt(prompt, max_length=512)
+            preferred = self._parse_preferred(decoded, cleaned)
+        except Exception as exc:
+            LOGGER.warning("Local candidate reranking failed for %s (%s): %s", entity, entity_type, exc)
+            preferred = []
+
+        if not preferred:
+            ordered = cleaned
+        else:
+            remaining = [candidate for candidate in cleaned if candidate not in preferred]
+            ordered = preferred + remaining
+        self.rerank_cache[key] = list(ordered)
+        return ordered
+
+    def rerank(self, entity: str, entity_type: str, candidates: list[str]) -> list[str]:
+        return self.rerank_candidates(entity, entity_type, candidates)
+
+    def critique_candidates(
+        self,
+        entity: str,
+        entity_type: str,
+        candidates: list[str],
+        family_hints: Optional[list[str]] = None,
+    ) -> list[str]:
+        return self.critique_candidates_debug(entity, entity_type, candidates, family_hints).approved
+
+    def critique_candidates_debug(
+        self,
+        entity: str,
+        entity_type: str,
+        candidates: list[str],
+        family_hints: Optional[list[str]] = None,
+    ) -> CritiquedCandidateResult:
+        cleaned = self._clean_input_candidates(candidates)
+        if not cleaned:
+            return CritiquedCandidateResult(approved=[], raw_output="", parsed_output=[])
+        hints = [hint for hint in (family_hints or []) if hint]
+        key = (entity_type.upper(), _normalize_text(entity).lower(), tuple(hints), tuple(cleaned))
+        if key in self.critique_cache:
+            return self.critique_cache[key]
+        if not self.enabled or self.model is None or self.tokenizer is None:
+            result = CritiquedCandidateResult(approved=list(cleaned), raw_output="", parsed_output=list(cleaned))
+            self.critique_cache[key] = result
+            return result
+        prompt = self._build_critique_prompt(_normalize_text(entity), entity_type.upper(), cleaned, hints)
+        raw_output = ""
+        try:
+            raw_output = self._run_prompt(prompt, max_length=640)
+            approved = self._parse_approved(raw_output, cleaned)
+        except Exception as exc:
+            LOGGER.warning("Local candidate critique failed for %s (%s): %s", entity, entity_type, exc)
+            approved = []
+        if not approved:
+            approved = list(cleaned)
+        result = CritiquedCandidateResult(approved=list(approved), raw_output=raw_output, parsed_output=list(approved))
+        self.critique_cache[key] = result
         return result
 
     def _resolve_device(self) -> str:
@@ -132,35 +216,92 @@ class CandidateLLMCompletion:
             return torch.bfloat16
         return torch.float16
 
-    def _build_prompt(self, entity: str, entity_type: str) -> str:
-        generalized_k = max(3, min(4, self.top_k))
+    def _build_rerank_prompt(self, entity: str, entity_type: str, candidates: list[str]) -> str:
+        bullets = "\n".join(f"{idx + 1}. {candidate}" for idx, candidate in enumerate(candidates))
+        return (
+            f"Entity type: {entity_type}\n"
+            f"Original entity: {entity}\n"
+            "Candidate generalized replacements:\n"
+            f"{bullets}\n"
+            "Task: choose up to 3 candidates from the list that are the safest and most natural broad replacements.\n"
+            "Rules:\n"
+            "- Choose only from the provided list.\n"
+            "- Prefer broad medically plausible replacements.\n"
+            "- Avoid another specific diagnosis or another specific drug name.\n"
+            "- Avoid awkward phrases.\n"
+            "Output exactly in one line:\n"
+            "preferred: candidate text 1; candidate text 2; candidate text 3"
+        )
+
+    def _build_generation_prompt(self, entity: str, entity_type: str, family_hints: list[str]) -> str:
+        hints_text = f"Known family hints: {', '.join(family_hints)}\n" if family_hints else ""
         if entity_type == "DISEASE":
-            guidance = (
-                "Use only broad medical phrases that end with one of: condition, disorder, disease, infection, syndrome, issue. "
-                "Do not output another specific diagnosis, subtype, anatomy-only phrase, or symptom-only phrase. "
-                "Good examples: skin condition; endocrine disorder; bacterial infection."
+            pattern = "... condition; ... disorder; ... disease; ... infection; ... syndrome; ... issue"
+            examples = (
+                "Examples:\n"
+                "Entity: psoriasis -> generalized: skin condition; inflammatory skin disorder\n"
+                "Entity: alopecia areata -> generalized: hair loss condition; autoimmune hair disorder\n"
+                "Entity: gonorrhea -> generalized: sexually transmitted infection; bacterial infection"
             )
         elif entity_type == "DRUG":
-            guidance = (
-                "Use only broad treatment phrases that end with one of: medication, therapy, treatment, medicine, drug. "
-                "Do not output another specific drug name, molecule name, dosage form, body part, or symptom phrase. "
-                "Good examples: pain medication; hormone therapy; anti inflammatory treatment."
+            pattern = "... medication; ... treatment; ... therapy; ... medicine; ... drug"
+            examples = (
+                "Examples:\n"
+                "Entity: ibuprofen -> generalized: pain medication; anti inflammatory medication\n"
+                "Entity: euthyrox -> generalized: thyroid medication; hormone medication\n"
+                "Entity: trileptal -> generalized: seizure medication; neurological medication"
             )
         else:
-            guidance = (
-                "Use only broad safe phrases. "
-                "Do not output another specific named entity."
-            )
+            pattern = "... condition"
+            examples = "Examples:\nEntity: example -> generalized: medical condition"
         return (
             f"Entity type: {entity_type}\n"
             f"Entity: {entity}\n"
-            "Generate privacy-safe generalized replacement candidates.\n"
-            f"Write exactly {generalized_k} short generalized phrases.\n"
-            "Rules: short ASCII phrases, 1 to 4 words, no names, no places, no IDs, no exact copy.\n"
-            "Each phrase must be broader and safer than the entity, not a synonym and not a specific subtype.\n"
-            f"{guidance}\n"
-            "Output exactly in this format:\n"
-            "generalized: item1; item2; item3; item4"
+            f"{hints_text}"
+            "Generate up to 3 broad, privacy-safe generalized replacements.\n"
+            "Rules:\n"
+            "- Do not repeat the original entity.\n"
+            "- Do not output another specific diagnosis or another specific drug name.\n"
+            f"- Prefer phrases shaped like: {pattern}\n"
+            "- Keep phrases short and medically plausible.\n"
+            f"{examples}\n"
+            "Output exactly in one line:\n"
+            "generalized: phrase 1; phrase 2; phrase 3"
+        )
+
+    def _build_critique_prompt(
+        self,
+        entity: str,
+        entity_type: str,
+        candidates: list[str],
+        family_hints: list[str],
+    ) -> str:
+        hints_text = f"Family hints: {', '.join(family_hints)}\n" if family_hints else ""
+        bullets = "\n".join(f"{idx + 1}. {candidate}" for idx, candidate in enumerate(candidates))
+        if entity_type == "DISEASE":
+            rubric = (
+                "Good generalized disease replacements are broad phrases like "
+                "'skin condition', 'endocrine disorder', 'infectious disease'.\n"
+                "Bad replacements are another specific disease, a near-copy of the original, or an awkward phrase."
+            )
+        elif entity_type == "DRUG":
+            rubric = (
+                "Good generalized drug replacements are broad phrases like "
+                "'pain medication', 'hormone medication', 'anti inflammatory treatment'.\n"
+                "Bad replacements are another specific drug, a brand/generic synonym, or an awkward phrase."
+            )
+        else:
+            rubric = "Approve only broad, safe generalized replacements."
+        return (
+            f"Entity type: {entity_type}\n"
+            f"Original entity: {entity}\n"
+            f"{hints_text}"
+            f"{rubric}\n"
+            "Review the candidate list and keep only candidates that are broad generalized replacements.\n"
+            "Candidate list:\n"
+            f"{bullets}\n"
+            "Output exactly in one line:\n"
+            "approved: candidate text 1; candidate text 2; candidate text 3"
         )
 
     def _encode_prompt(self, user_prompt: str) -> str:
@@ -169,8 +310,8 @@ class CandidateLLMCompletion:
                 {
                     "role": "system",
                     "content": (
-                        "You generate short privacy-safe medical replacement candidates. "
-                        "Output only the requested lines and nothing else."
+                        "You rank privacy-safe medical replacement candidates. "
+                        "Use only the provided options. Output only the requested line."
                     ),
                 },
                 {"role": "user", "content": user_prompt},
@@ -185,68 +326,113 @@ class CandidateLLMCompletion:
                 return user_prompt + "\nassistant:\n"
         return user_prompt
 
-    def _parse_output(self, text: str, original: str) -> CompletionResult:
-        generalized: list[str] = []
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            try:
-                payload = json.loads(match.group(0))
-                generalized = payload.get("generalized", []) or []
-            except Exception:
-                pass
-        if not generalized:
-            generalized = self._extract_field_values(text, "generalized")
-        original_key = re.sub(r"[^a-z0-9]+", "", original.lower())
-        generalized = self._clean_candidates(generalized, original_key)
-        generalized = generalized[: max(3, min(4, self.top_k))]
-        return CompletionResult(generalized=generalized, safe_related=[])
+    def _run_prompt(self, prompt: str, max_length: int) -> str:
+        encoded_prompt = self._encode_prompt(prompt)
+        inputs = self.tokenizer(encoded_prompt, return_tensors="pt", truncation=True, max_length=max_length)
+        inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}
+        prompt_length = int(inputs["input_ids"].shape[-1])
+        with torch.no_grad():
+            output = self.model.generate(
+                **inputs,
+                do_sample=False,
+                num_beams=1,
+                max_new_tokens=self.max_new_tokens,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        if self.model_family == "causal":
+            generated_tokens = output[0][prompt_length:]
+            return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return self.tokenizer.decode(output[0], skip_special_tokens=True)
 
-    def _extract_field_values(self, text: str, field_name: str) -> list[str]:
-        patterns = [
-            rf"{field_name}\s*:\s*(.+)",
-            rf"{field_name.replace('_', '[_ ]')}\s*:\s*(.+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            raw = match.group(1).strip()
-            raw = raw.splitlines()[0].strip()
-            return self._split_items(raw)
-
-        # Fallback for bullet-like outputs such as:
-        # generalized - item1 - item2
-        match = re.search(rf"{field_name.replace('_', '[_ ]')}\s*[-:]\s*(.+)", text, flags=re.IGNORECASE)
-        if match:
-            raw = match.group(1).strip()
-            raw = raw.splitlines()[0].strip()
-            return self._split_items(raw)
-        return []
-
-    def _split_items(self, raw: str) -> list[str]:
-        parts = re.split(r"[;,|]", raw)
-        if len(parts) <= 1:
-            parts = re.split(r"\s+-\s+", raw)
-        return [part.strip(" -") for part in parts if part.strip(" -")]
-
-    def _clean_candidates(self, candidates: list[str], original_key: str) -> list[str]:
+    def _clean_input_candidates(self, candidates: list[str]) -> list[str]:
         cleaned = []
         seen = set()
         for candidate in candidates:
             normalized = _normalize_text(candidate)
             if not normalized:
                 continue
+            key = _normalize_key(normalized)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(normalized)
+        return cleaned[: self.top_k]
+
+    def _parse_preferred(self, text: str, candidates: list[str]) -> list[str]:
+        candidates_by_key = {_normalize_key(candidate): candidate for candidate in candidates}
+        keyed_candidates = list(candidates_by_key.items())
+        preferred: list[str] = []
+        match = re.search(r"preferred\s*:\s*(.+)", text, flags=re.IGNORECASE)
+        raw = match.group(1).strip() if match else text.strip()
+        raw = raw.splitlines()[0].strip()
+        parts = [part.strip(" -") for part in re.split(r"[;,|]", raw) if part.strip(" -")]
+        for part in parts:
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(candidates):
+                    candidate = candidates[idx]
+                    if candidate not in preferred:
+                        preferred.append(candidate)
+                continue
+            key = _normalize_key(part)
+            if key in candidates_by_key:
+                candidate = candidates_by_key[key]
+                if candidate not in preferred:
+                    preferred.append(candidate)
+                continue
+            for candidate_key, candidate in keyed_candidates:
+                if key and (key in candidate_key or candidate_key in key):
+                    if candidate not in preferred:
+                        preferred.append(candidate)
+                    break
+        return preferred[: min(3, len(candidates))]
+
+    def _parse_generated(self, text: str) -> list[str]:
+        match = re.search(r"generalized\s*:\s*(.+)", text, flags=re.IGNORECASE)
+        if match:
+            raw = match.group(1).strip()
+        else:
+            # Fallback: many instruct models directly emit a bare semicolon/comma
+            # separated list without the `generalized:` prefix.
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            raw = lines[0] if lines else text.strip()
+        raw = raw.splitlines()[0].strip()
+        parts = [part.strip(" -") for part in re.split(r"[;,|]", raw) if part.strip(" -")]
+        if len(parts) <= 1:
+            parts = [part.strip(" -") for part in re.split(r"\s+-\s+|\s*\d+\.\s*", raw) if part.strip(" -")]
+        cleaned = []
+        seen = set()
+        for part in parts:
+            normalized = _normalize_text(part)
+            key = _normalize_key(normalized)
+            if not key or key in seen:
+                continue
             if len(normalized.split()) > 4:
                 continue
             if re.search(r"[^A-Za-z0-9\s/_-]", normalized):
                 continue
-            key = re.sub(r"[^a-z0-9]+", "", normalized.lower())
-            if key in {"item1", "item2", "item3", "generalized", "saferelated", "related", "broader", "safer"}:
-                continue
-            if not key or key == original_key or original_key in key or key in original_key:
-                continue
-            if key in seen:
-                continue
             seen.add(key)
             cleaned.append(normalized)
-        return cleaned
+        return cleaned[:3]
+
+    def _parse_approved(self, text: str, candidates: list[str]) -> list[str]:
+        match = re.search(r"approved\s*:\s*(.+)", text, flags=re.IGNORECASE)
+        raw = match.group(1).strip() if match else text.strip()
+        raw = raw.splitlines()[0].strip()
+        parts = [part.strip(" -") for part in re.split(r"[;,|]", raw) if part.strip(" -")]
+        candidate_map = {_normalize_key(candidate): candidate for candidate in candidates}
+        approved: list[str] = []
+        for part in parts:
+            key = _normalize_key(part)
+            if key in candidate_map:
+                candidate = candidate_map[key]
+                if candidate not in approved:
+                    approved.append(candidate)
+                continue
+            for candidate_key, candidate in candidate_map.items():
+                if key and (key in candidate_key or candidate_key in key):
+                    if candidate not in approved:
+                        approved.append(candidate)
+                    break
+        return approved[: len(candidates)]

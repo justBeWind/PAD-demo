@@ -1,15 +1,15 @@
 {
-  "schema_version": "typed_resource_v1",
+  "schema_version": "typed_resource_v2",
   "metadata": {
     "resource_type": "DRUG",
-    "builder_version": "1.0.0",
-    "generated_at_utc": "2026-03-05T06:23:58.166170+00:00",
+    "builder_version": "2.1.0",
+    "generated_at_utc": "2026-03-07T16:10:54.434560+00:00",
     "source_path": "/root/autodl-tmp/PAD-demo/resources/drug_terms.json",
     "source_sha256": "e528a0178d9b3caa58fc6d5173ffd894f703c7c2ada58be235e3991b46cd089e",
     "source_item_count": 19,
     "record_count": 19,
     "source_metadata": {
-      "name": "unspecified",
+      "name": "prototype seed",
       "url": "",
       "license": "",
       "version": ""
@@ -19,7 +19,8 @@
       "dropped_empty": 0,
       "normalized_records": 19,
       "duplicates_merged": 0,
-      "generalized_generated": 6,
+      "family_generated": 19,
+      "generalized_generated": 10,
       "related_filled": 0
     },
     "normalization_policy": {
@@ -45,7 +46,11 @@
         "aspirin"
       ],
       "generalized": [
-        "pain medication"
+        "pain medication",
+        "symptom relief medication"
+      ],
+      "family": [
+        "pain_relief"
       ],
       "tags": [
         "analgesic",
@@ -67,6 +72,9 @@
         "antibiotic medication",
         "infection treatment"
       ],
+      "family": [
+        "anti_infective"
+      ],
       "tags": [
         "antibiotic"
       ],
@@ -78,18 +86,28 @@
       "related": [],
       "generalized": [
         "pain medication",
+        "symptom relief medication",
         "anti inflammatory medication"
       ],
       "tags": [],
-      "canonical_id": "drug:aspirin"
+      "canonical_id": "drug:aspirin",
+      "family": [
+        "pain_relief"
+      ]
     },
     {
       "term": "azithromycin",
       "aliases": [],
       "related": [],
-      "generalized": [],
+      "generalized": [
+        "medical treatment",
+        "prescription medication"
+      ],
       "tags": [],
-      "canonical_id": "drug:azithromycin"
+      "canonical_id": "drug:azithromycin",
+      "family": [
+        "general_therapy"
+      ]
     },
     {
       "term": "clotrimazole",
@@ -102,6 +120,10 @@
         "antifungal medication",
         "skin treatment"
       ],
+      "family": [
+        "anti_infective",
+        "dermatologic"
+      ],
       "tags": [
         "antifungal",
         "dermatology"
@@ -112,31 +134,45 @@
       "term": "doxycycline",
       "aliases": [],
       "related": [],
-      "generalized": [],
+      "generalized": [
+        "medical treatment",
+        "prescription medication"
+      ],
       "tags": [],
-      "canonical_id": "drug:doxycycline"
+      "canonical_id": "drug:doxycycline",
+      "family": [
+        "general_therapy"
+      ]
     },
     {
       "term": "escitalopram",
       "aliases": [],
       "related": [],
       "generalized": [
-        "antidepressant medication",
-        "psychiatric medication"
+        "psychiatric medication",
+        "mental health treatment",
+        "antidepressant medication"
       ],
       "tags": [],
-      "canonical_id": "drug:escitalopram"
+      "canonical_id": "drug:escitalopram",
+      "family": [
+        "psychiatric"
+      ]
     },
     {
       "term": "fluoxetine",
       "aliases": [],
       "related": [],
       "generalized": [
-        "antidepressant medication",
-        "psychiatric medication"
+        "psychiatric medication",
+        "mental health treatment",
+        "antidepressant medication"
       ],
       "tags": [],
-      "canonical_id": "drug:fluoxetine"
+      "canonical_id": "drug:fluoxetine",
+      "family": [
+        "psychiatric"
+      ]
     },
     {
       "term": "ibuprofen",
@@ -144,10 +180,14 @@
       "related": [],
       "generalized": [
         "pain medication",
+        "symptom relief medication",
         "anti inflammatory medication"
       ],
       "tags": [],
-      "canonical_id": "drug:ibuprofen"
+      "canonical_id": "drug:ibuprofen",
+      "family": [
+        "pain_relief"
+      ]
     },
     {
       "term": "levothyroxine",
@@ -160,6 +200,9 @@
       "generalized": [
         "thyroid medication",
         "hormone replacement therapy"
+      ],
+      "family": [
+        "endocrine"
       ],
       "tags": [
         "endocrine",
@@ -179,6 +222,9 @@
         "diabetes medication",
         "blood sugar medication"
       ],
+      "family": [
+        "endocrine"
+      ],
       "tags": [
         "antidiabetic",
         "endocrine"
@@ -190,10 +236,15 @@
       "aliases": [],
       "related": [],
       "generalized": [
+        "anti infective medication",
+        "infection treatment",
         "antifungal medication"
       ],
       "tags": [],
-      "canonical_id": "drug:miconazole"
+      "canonical_id": "drug:miconazole",
+      "family": [
+        "anti_infective"
+      ]
     },
     {
       "term": "oxcarbazepine",
@@ -206,6 +257,9 @@
       "generalized": [
         "antiepileptic medication",
         "neurological medication"
+      ],
+      "family": [
+        "neurological"
       ],
       "tags": [
         "neurology",
@@ -226,6 +280,9 @@
         "targeted cancer therapy",
         "oncology medication"
       ],
+      "family": [
+        "general_therapy"
+      ],
       "tags": [
         "oncology",
         "tki"
@@ -242,6 +299,9 @@
       "generalized": [
         "steroid medication",
         "anti inflammatory medication"
+      ],
+      "family": [
+        "anti_inflammatory"
       ],
       "tags": [
         "steroid",
@@ -260,6 +320,10 @@
       "generalized": [
         "nerve pain medication",
         "neurological medication"
+      ],
+      "family": [
+        "neurological",
+        "pain_relief"
       ],
       "tags": [
         "neurology",
@@ -280,6 +344,9 @@
         "antidepressant medication",
         "psychiatric medication"
       ],
+      "family": [
+        "psychiatric"
+      ],
       "tags": [
         "ssri",
         "psychiatric"
@@ -290,17 +357,29 @@
       "term": "sorafenib",
       "aliases": [],
       "related": [],
-      "generalized": [],
+      "generalized": [
+        "medical treatment",
+        "prescription medication"
+      ],
       "tags": [],
-      "canonical_id": "drug:sorafenib"
+      "canonical_id": "drug:sorafenib",
+      "family": [
+        "general_therapy"
+      ]
     },
     {
       "term": "sunitinib",
       "aliases": [],
       "related": [],
-      "generalized": [],
+      "generalized": [
+        "medical treatment",
+        "prescription medication"
+      ],
       "tags": [],
-      "canonical_id": "drug:sunitinib"
+      "canonical_id": "drug:sunitinib",
+      "family": [
+        "general_therapy"
+      ]
     }
   ]
 }
