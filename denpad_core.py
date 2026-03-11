@@ -50,6 +50,9 @@ SENSITIVE_PRIORITY_LABELS = {
     "EMAIL",
     "PHONE",
     "AGE",
+    "DOSE",
+    "SYMPTOM_PHRASE",
+    "DURATION_PHRASE",
     "DISEASE",
     "DRUG",
     "ORG",
@@ -64,6 +67,9 @@ SENSITIVE_PRIORITY_ORDER = [
     "EMAIL",
     "PHONE",
     "AGE",
+    "DOSE",
+    "SYMPTOM_PHRASE",
+    "DURATION_PHRASE",
     "ORG",
     "GPE",
     "LOC",
@@ -163,6 +169,9 @@ DEFAULT_FALLBACK_CANDIDATES = {
     "DRUG": ["ibuprofen", "amoxicillin", "acetaminophen", "metformin", "aspirin"],
     "DATE": ["last week", "two months ago", "recently"],
     "AGE": ["29", "41", "52"],
+    "DOSE": ["adjusted dose", "modified dosage", "standard dose"],
+    "SYMPTOM_PHRASE": ["medical symptoms", "ongoing symptoms", "health-related symptoms"],
+    "DURATION_PHRASE": ["short-term duration", "ongoing duration", "long-term duration"],
 }
 
 DEFAULT_MEDICAL_DISEASE_TERMS = {
@@ -259,7 +268,35 @@ MEDICAL_TEST_HINTS = {
 
 EMAIL_PATTERN = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b")
 PHONE_PATTERN = re.compile(r"(?:\+?\d[\d\-\s()]{7,}\d)")
-AGE_PATTERN = re.compile(r"\b(\d{1,3})\s*(?:years?\s*old|y/o)\b", re.IGNORECASE)
+AGE_PATTERNS = [
+    re.compile(r"\b(\d{1,3})\s*(?:years?\s*old|yrs?\s*old|y/o)\b", re.IGNORECASE),
+    re.compile(r"\baged\s+(\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\bage\s*(?:is|:)?\s*(\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\bI[' ]?m\s+(\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\bam\s+(\d{1,3})\s*(?:years?\s*old|yrs?\s*old)?\b", re.IGNORECASE),
+]
+DURATION_PATTERN = re.compile(
+    r"\b(?:for|since|past|last|over|about|after)\s+"
+    r"(?:the\s+)?(?:last\s+)?(?:over\s+)?(?:about\s+)?"
+    r"(\d+\s+(?:days?|weeks?|months?|years?)|"
+    r"(?:a|an|few|several)\s+(?:days?|weeks?|months?|years?)|"
+    r"(?:long\s+time|short\s+time))\b",
+    re.IGNORECASE,
+)
+DOSE_PATTERN = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|mL|iu|IU|units?|drops?|tablets?|capsules?|puffs?|bid|tid|qid|mci)\b",
+    re.IGNORECASE,
+)
+SYMPTOM_PATTERNS = [
+    (re.compile(r"\b(?:pain|burning|discomfort)\s+(?:while|when)\s+(?:urinating|passing urine|peeing)\b", re.IGNORECASE), "urinary"),
+    (re.compile(r"\b(?:frequent urge to urinate|urgent urination|frequent urination)\b", re.IGNORECASE), "urinary"),
+    (re.compile(r"\bshort(?:ness)? of breath\b", re.IGNORECASE), "respiratory"),
+    (re.compile(r"\b(?:short term memory loss|memory loss|memory problems|poor memory)\b", re.IGNORECASE), "cognitive"),
+    (re.compile(r"\b(?:panic attacks?|panic episodes?)\b", re.IGNORECASE), "mental_health"),
+    (re.compile(r"\bhair loss\b", re.IGNORECASE), "dermatologic"),
+    (re.compile(r"\b(?:chest pain|back pain|joint pain|muscle pain|abdominal pain)\b", re.IGNORECASE), "pain"),
+    (re.compile(r"\b(?:itching|skin irritation|rash|skin rash)\b", re.IGNORECASE), "dermatologic"),
+]
 
 
 def get_default_resources_dir() -> str:
@@ -700,6 +737,8 @@ def looks_like_medical_test_text(text: str) -> bool:
 def detect_entity_category(label: str, text: str) -> str:
     if label in {"EMAIL", "PHONE"}:
         return "structured"
+    if label in {"DURATION_PHRASE", "DOSE", "SYMPTOM_PHRASE"}:
+        return "categorical"
     if label in {"DATE", "TIME", "MONEY", "PERCENT", "CARDINAL", "QUANTITY", "AGE"}:
         return "numeric"
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text.strip()):
@@ -818,20 +857,73 @@ class EntityExtractor:
                     evidence_source="regex",
                 )
             )
-        for match in AGE_PATTERN.finditer(text):
+        seen_ages = set()
+        for pattern in AGE_PATTERNS:
+            for match in pattern.finditer(text):
+                span_key = (match.start(1), match.end(1))
+                if span_key in seen_ages:
+                    continue
+                seen_ages.add(span_key)
+                results.append(
+                    ExtractedEntity(
+                        text=match.group(1),
+                        label="AGE",
+                        start_char=match.start(1),
+                        end_char=match.end(1),
+                        normalized_text=normalize_entity_text(match.group(1)),
+                        category="numeric",
+                        doc_index=doc_index,
+                        evidence_confidence=0.95,
+                        evidence_source="regex",
+                    )
+                )
+        for match in DURATION_PATTERN.finditer(text):
+            phrase = match.group(0).strip()
             results.append(
                 ExtractedEntity(
-                    text=match.group(1),
-                    label="AGE",
-                    start_char=match.start(1),
-                    end_char=match.end(1),
-                    normalized_text=normalize_entity_text(match.group(1)),
-                    category="numeric",
+                    text=phrase,
+                    label="DURATION_PHRASE",
+                    start_char=match.start(),
+                    end_char=match.end(),
+                    normalized_text=normalize_entity_text(phrase),
+                    category="categorical",
                     doc_index=doc_index,
-                    evidence_confidence=0.95,
+                    evidence_confidence=0.90,
                     evidence_source="regex",
                 )
             )
+        for match in DOSE_PATTERN.finditer(text):
+            phrase = match.group(0).strip()
+            results.append(
+                ExtractedEntity(
+                    text=phrase,
+                    label="DOSE",
+                    start_char=match.start(),
+                    end_char=match.end(),
+                    normalized_text=normalize_entity_text(phrase),
+                    category="categorical",
+                    doc_index=doc_index,
+                    evidence_confidence=0.92,
+                    evidence_source="regex",
+                )
+            )
+        for pattern, family in SYMPTOM_PATTERNS:
+            for match in pattern.finditer(text):
+                phrase = match.group(0).strip()
+                results.append(
+                    ExtractedEntity(
+                        text=phrase,
+                        label="SYMPTOM_PHRASE",
+                        start_char=match.start(),
+                        end_char=match.end(),
+                        normalized_text=normalize_entity_text(phrase),
+                        category="categorical",
+                        doc_index=doc_index,
+                        evidence_confidence=0.88,
+                        evidence_source="regex",
+                        candidate_trace={"symptom_family_hints": [family]},
+                    )
+                )
         return results
 
     def _extract_medical_entities(self, text: str, doc_index: int = -1) -> list[ExtractedEntity]:
@@ -1176,6 +1268,7 @@ class CandidateGenerator:
         semantic_reranker: Optional[SemanticReranker] = None,
         medical_typer: Optional[MedicalTyper] = None,
         llm_completion: Optional[CandidateLLMCompletion] = None,
+        attack_strong: bool = False,
     ) -> None:
         self.density_scorer = density_scorer
         self.resource_registry = resource_registry or ResourceRegistry()
@@ -1183,6 +1276,7 @@ class CandidateGenerator:
         self.semantic_reranker = semantic_reranker or SemanticReranker()
         self.medical_typer = medical_typer or MedicalTyper(resource_registry=self.resource_registry)
         self.llm_completion = llm_completion
+        self.attack_strong = attack_strong
         self.typed_index = TypedCandidateIndex(
             resource_registry=self.resource_registry,
             semantic_reranker=self.semantic_reranker,
@@ -1192,10 +1286,16 @@ class CandidateGenerator:
         )
 
     def generate(self, entity: ExtractedEntity) -> list[str]:
+        if entity.label == "DOSE":
+            return self._generate_dose_candidates(entity)
+        if entity.label == "SYMPTOM_PHRASE":
+            return self._generate_symptom_phrase_candidates(entity)
         if entity.category == "numeric":
             return self._generate_numeric_candidates(entity)
         if entity.category == "structured":
             return self._generate_structured_candidates(entity)
+        if entity.label == "DURATION_PHRASE":
+            return self._generate_duration_candidates(entity)
         return self._generate_categorical_candidates(entity)
 
     def _generate_categorical_candidates(self, entity: ExtractedEntity) -> list[str]:
@@ -1499,25 +1599,225 @@ class CandidateGenerator:
 
         candidates = [text]
         source_map: dict[str, str] = {normalize_entity_text(text): "original"}
+        level_map: dict[str, str] = {normalize_entity_text(text): "original"}
         if entity.label == "AGE":
-            for delta in (-10, -5, -2, 2, 5, 10):
-                candidate = min(max(int(round(value + delta)), 0), 120)
-                candidates.append(str(candidate))
-                source_map.setdefault(normalize_entity_text(str(candidate)), "numeric")
+            age = int(round(value))
+            if age < 18:
+                deltas = (-2, -1, 1, 2)
+            elif age < 40:
+                deltas = (-3, -2, -1, 1, 2, 3)
+            elif age < 65:
+                deltas = (-4, -2, -1, 1, 2, 4)
+            else:
+                deltas = (-5, -3, -1, 1, 3, 5)
+            for delta in deltas:
+                candidate = min(max(age + delta, 0), 120)
+                formatted = str(candidate)
+                candidates.append(formatted)
+                source_map.setdefault(normalize_entity_text(formatted), "numeric")
+                level_map.setdefault(normalize_entity_text(formatted), "generalized")
         else:
-            for delta in (-3, -2, -1, 1, 2, 3):
+            deltas = (-3, -2, -1, 1, 2, 3)
+            if entity.label == "DATE":
+                deltas = (-2, -1, 1, 2)
+            for delta in deltas:
                 candidate = value + delta
                 if text.isdigit():
                     formatted = str(int(round(candidate)))
                     candidates.append(formatted)
                     source_map.setdefault(normalize_entity_text(formatted), "numeric")
+                    level_map.setdefault(normalize_entity_text(formatted), "generalized")
                 else:
                     formatted = f"{candidate:.1f}"
                     candidates.append(formatted)
                     source_map.setdefault(normalize_entity_text(formatted), "numeric")
+                    level_map.setdefault(normalize_entity_text(formatted), "generalized")
         deduped = self._dedupe_candidates(candidates, text)
-        self._attach_candidate_sources(entity, deduped, source_map, default_source="numeric")
+        self._attach_candidate_sources(
+            entity,
+            deduped,
+            source_map,
+            default_source="numeric",
+            level_map=level_map,
+            default_level="generalized",
+        )
         return deduped
+
+    def _generate_duration_candidates(self, entity: ExtractedEntity) -> list[str]:
+        text = entity.normalized_text
+        lowered = text.lower()
+        candidates = [text]
+        source_map: dict[str, str] = {normalize_entity_text(text): "original"}
+        level_map: dict[str, str] = {normalize_entity_text(text): "original"}
+
+        templates: list[str]
+        if "year" in lowered:
+            templates = ["long-term duration", "chronic duration", "multi-year period"]
+        elif "month" in lowered:
+            templates = ["extended duration", "multi-month period", "ongoing duration"]
+        elif "week" in lowered:
+            templates = ["multi-week duration", "ongoing duration", "extended period"]
+        elif "day" in lowered:
+            templates = ["short-term duration", "recent duration", "brief period"]
+        elif "hour" in lowered:
+            templates = ["very short-term duration", "recent duration", "brief period"]
+        else:
+            templates = ["ongoing duration", "extended period", "recent period"]
+
+        for candidate in templates:
+            normalized_candidate = normalize_entity_text(candidate)
+            if not normalized_candidate:
+                continue
+            candidates.append(normalized_candidate)
+            source_map.setdefault(normalized_candidate, "fallback")
+            level_map.setdefault(normalized_candidate, "generalized")
+
+        deduped = self._dedupe_candidates(candidates, text)
+        self._attach_candidate_sources(
+            entity,
+            deduped,
+            source_map,
+            default_source="fallback",
+            level_map=level_map,
+            default_level="generalized",
+        )
+        return deduped
+
+    def _generate_dose_candidates(self, entity: ExtractedEntity) -> list[str]:
+        text = entity.normalized_text
+        match = DOSE_PATTERN.search(text)
+        if not match:
+            candidates = self._dedupe_candidates([text, *DEFAULT_FALLBACK_CANDIDATES.get("DOSE", [])], text)
+            self._attach_candidate_sources(
+                entity,
+                candidates,
+                {normalize_entity_text(text): "original"},
+                default_source="fallback",
+                level_map={normalize_entity_text(text): "original"},
+                default_level="generalized",
+            )
+            return candidates
+
+        value = float(match.group(1))
+        unit = match.group(2)
+        candidates = [text]
+        source_map: dict[str, str] = {normalize_entity_text(text): "original"}
+        level_map: dict[str, str] = {normalize_entity_text(text): "original"}
+
+        if value <= 5:
+            deltas = (-1, 1, 2)
+        elif value <= 20:
+            deltas = (-2, -1, 1, 2, 3)
+        elif value <= 100:
+            deltas = (-5, -2, 2, 5, 10)
+        else:
+            deltas = (-10, -5, 5, 10, 20)
+
+        for delta in deltas:
+            candidate_value = max(value + delta, 1)
+            if float(candidate_value).is_integer():
+                rendered_value = str(int(candidate_value))
+            else:
+                rendered_value = f"{candidate_value:.1f}".rstrip("0").rstrip(".")
+            candidate = f"{rendered_value} {unit}"
+            normalized_candidate = normalize_entity_text(candidate)
+            candidates.append(normalized_candidate)
+            source_map.setdefault(normalized_candidate, "numeric")
+            level_map.setdefault(normalized_candidate, "generalized")
+
+        for candidate in DEFAULT_FALLBACK_CANDIDATES.get("DOSE", []):
+            normalized_candidate = normalize_entity_text(candidate)
+            if normalized_candidate:
+                candidates.append(normalized_candidate)
+                source_map.setdefault(normalized_candidate, "fallback")
+                level_map.setdefault(normalized_candidate, "generalized")
+
+        deduped = self._dedupe_candidates(candidates, text)
+        self._attach_candidate_sources(
+            entity,
+            deduped,
+            source_map,
+            default_source="numeric",
+            level_map=level_map,
+            default_level="generalized",
+        )
+        return deduped
+
+    def _generate_symptom_phrase_candidates(self, entity: ExtractedEntity) -> list[str]:
+        original = entity.normalized_text
+        trace = dict(entity.candidate_trace or {})
+        family_hints = list(trace.get("symptom_family_hints") or trace.get("resource_family_hints") or [])
+        llm_generated_candidates: list[str] = []
+        llm_approved_candidates: list[str] = []
+        llm_generation_raw = ""
+        llm_critique_raw = ""
+
+        if self.llm_completion is not None:
+            generation_result = self.llm_completion.generate_candidates_debug(original, entity.label, family_hints)
+            llm_generated_candidates = list(generation_result.generated)
+            llm_generation_raw = generation_result.raw_output
+            critique_result = self.llm_completion.critique_candidates_debug(
+                original,
+                entity.label,
+                llm_generated_candidates,
+                family_hints,
+            )
+            llm_approved_candidates = list(critique_result.approved)
+            llm_critique_raw = critique_result.raw_output
+
+        fallback_map = {
+            "urinary": ["urinary discomfort", "urinary symptoms", "bladder discomfort"],
+            "respiratory": ["breathing symptoms", "respiratory discomfort", "chest symptoms"],
+            "cognitive": ["cognitive symptoms", "memory-related symptoms", "neurological symptoms"],
+            "mental_health": ["mental health symptoms", "emotional symptoms", "psychiatric symptoms"],
+            "dermatologic": ["skin symptoms", "skin irritation", "hair-related symptoms"],
+            "pain": ["pain symptoms", "musculoskeletal discomfort", "physical discomfort"],
+        }
+        fallback_candidates: list[str] = []
+        for hint in family_hints:
+            for candidate in fallback_map.get(normalize_entity_text(hint).lower(), []):
+                normalized_candidate = normalize_entity_text(candidate)
+                if normalized_candidate and normalized_candidate not in fallback_candidates:
+                    fallback_candidates.append(normalized_candidate)
+        if not fallback_candidates:
+            fallback_candidates = list(DEFAULT_FALLBACK_CANDIDATES.get("SYMPTOM_PHRASE", []))
+
+        candidates = [original]
+        source_map: dict[str, str] = {normalize_entity_text(original): "original"}
+        level_map: dict[str, str] = {normalize_entity_text(original): "original"}
+        for candidate in [*llm_approved_candidates, *fallback_candidates]:
+            normalized_candidate = normalize_entity_text(candidate)
+            if not normalized_candidate or normalized_candidate.lower() == original.lower():
+                continue
+            candidates.append(normalized_candidate)
+            source_map.setdefault(
+                normalized_candidate,
+                "llm_completion" if normalized_candidate in {normalize_entity_text(c) for c in llm_approved_candidates} else "fallback",
+            )
+            level_map.setdefault(normalized_candidate, "generalized")
+
+        trace["llm_generated_candidates"] = list(llm_generated_candidates)
+        trace["llm_approved_candidates"] = list(llm_approved_candidates)
+        trace["llm_generation_family_hints"] = list(family_hints)
+        trace["llm_generate_raw_output"] = llm_generation_raw
+        trace["llm_critique_raw_output"] = llm_critique_raw
+        trace["llm_generate_parsed"] = list(llm_generated_candidates)
+        trace["llm_generate_filtered_out"] = [
+            candidate for candidate in llm_generated_candidates if candidate not in llm_approved_candidates
+        ]
+        entity.candidate_trace = trace
+
+        deduped = self._dedupe_candidates(candidates, original)
+        ranked = self._rank_candidates(entity, deduped)
+        self._attach_candidate_sources(
+            entity,
+            ranked,
+            source_map,
+            default_source="fallback",
+            level_map=level_map,
+            default_level="generalized",
+        )
+        return ranked
 
     def _generate_structured_candidates(self, entity: ExtractedEntity) -> list[str]:
         text = entity.normalized_text
@@ -1526,24 +1826,52 @@ class CandidateGenerator:
             domain = domain or "example.com"
             candidates = [text]
             source_map: dict[str, str] = {normalize_entity_text(text): "original"}
+            level_map: dict[str, str] = {normalize_entity_text(text): "original"}
+            local_len = max(len(local), 4)
             for prefix in ("user", "contact", "member", "patient"):
-                candidate = f"{prefix}{len(local)}@{domain}"
+                candidate = f"{prefix}{local_len}@{domain}"
                 candidates.append(candidate)
                 source_map.setdefault(normalize_entity_text(candidate), "structured")
+                level_map.setdefault(normalize_entity_text(candidate), "generalized")
+            for prefix in ("patient.case", "support.user"):
+                candidate = f"{prefix}{local_len}@{domain}"
+                candidates.append(candidate)
+                source_map.setdefault(normalize_entity_text(candidate), "structured")
+                level_map.setdefault(normalize_entity_text(candidate), "generalized")
             deduped = self._dedupe_candidates(candidates, text)
-            self._attach_candidate_sources(entity, deduped, source_map, default_source="structured")
+            self._attach_candidate_sources(
+                entity,
+                deduped,
+                source_map,
+                default_source="structured",
+                level_map=level_map,
+                default_level="generalized",
+            )
             return deduped
 
         digits = re.sub(r"\D", "", text)
         candidates = [text]
         source_map = {normalize_entity_text(text): "original"}
+        level_map = {normalize_entity_text(text): "original"}
         if digits:
-            for suffix in ("1234", "5678", "2468", "1357"):
-                new_digits = (digits[:-4] + suffix) if len(digits) >= 4 else suffix
-                candidates.append(new_digits)
-                source_map.setdefault(normalize_entity_text(new_digits), "structured")
+            prefixes = [digits[: max(len(digits) - 4, 0)], digits[: max(len(digits) - 3, 0)]]
+            for suffix in ("1234", "5678", "2468", "1357", "9081", "3141"):
+                for prefix in prefixes:
+                    new_digits = (prefix + suffix) if prefix else suffix
+                    if len(new_digits) != len(digits):
+                        continue
+                    candidates.append(new_digits)
+                    source_map.setdefault(normalize_entity_text(new_digits), "structured")
+                    level_map.setdefault(normalize_entity_text(new_digits), "generalized")
         deduped = self._dedupe_candidates(candidates, text)
-        self._attach_candidate_sources(entity, deduped, source_map, default_source="structured")
+        self._attach_candidate_sources(
+            entity,
+            deduped,
+            source_map,
+            default_source="structured",
+            level_map=level_map,
+            default_level="generalized",
+        )
         return deduped
 
     def _attach_candidate_sources(
@@ -1621,7 +1949,10 @@ class CandidateGenerator:
         if entity.category == "categorical":
             if entity.label in {"DISEASE", "DRUG"} and candidate_source == "llm_completion":
                 return self._passes_llm_generalized_guard(entity, candidate)
-            if abs(len(candidate_tokens) - len(original_tokens)) > 1:
+            max_token_delta = 1
+            if entity.label == "SYMPTOM_PHRASE":
+                max_token_delta = 2
+            if abs(len(candidate_tokens) - len(original_tokens)) > max_token_delta:
                 return False
             if entity.label == "DISEASE":
                 if any(token.lower() in BAD_DISEASE_CANDIDATE_SUFFIXES for token in candidate_tokens):
@@ -1725,6 +2056,23 @@ class CandidateGenerator:
             if not tokens or tokens[-1] not in allowed_last_tokens:
                 return False
             if any(token in disallowed_specific_tokens for token in tokens[:-1]):
+                return False
+            if token_count == 1:
+                return False
+            return True
+        if entity.label == "SYMPTOM_PHRASE":
+            allowed_last_tokens = {
+                "symptoms",
+                "discomfort",
+                "pain",
+                "issue",
+                "issues",
+                "problem",
+                "problems",
+                "condition",
+            }
+            tokens = [token for token in re.split(r"\s+", lowered) if token]
+            if not tokens or tokens[-1] not in allowed_last_tokens:
                 return False
             if token_count == 1:
                 return False
@@ -1972,6 +2320,9 @@ class CandidateGenerator:
             "EMAIL": 0.90,
             "PHONE": 0.90,
             "AGE": 0.75,
+            "DOSE": 0.80,
+            "SYMPTOM_PHRASE": 0.82,
+            "DURATION_PHRASE": 0.70,
             "ORG": 0.55,
             "GPE": 0.50,
             "LOC": 0.50,
@@ -1988,7 +2339,7 @@ class CandidateGenerator:
     ) -> float:
         # High-risk entities should strongly prefer generalized candidates and
         # only weakly preserve the original token as a fallback.
-        if entity.label not in {"DISEASE", "DRUG"}:
+        if entity.label not in {"DISEASE", "DRUG", "DOSE", "SYMPTOM_PHRASE"}:
             if level == "original":
                 return -0.03 * risk
             if level == "generalized":
@@ -1996,8 +2347,12 @@ class CandidateGenerator:
             return 0.0
 
         if level == "original":
+            if entity.label in {"DOSE", "SYMPTOM_PHRASE"}:
+                return -0.16 - 0.42 * risk
             return -0.24 - 0.52 * risk
         if level == "generalized":
+            if entity.label in {"DOSE", "SYMPTOM_PHRASE"}:
+                return 0.24 + 0.40 * risk
             return 0.32 + 0.48 * risk
         if level == "related":
             return 0.02 + 0.08 * risk
@@ -2122,6 +2477,13 @@ class CandidateGenerator:
         return []
 
     def should_force_generalized_mode(self, entity: ExtractedEntity, candidates: list[str]) -> bool:
+        if entity.label in {"DOSE", "SYMPTOM_PHRASE"}:
+            generalized = [
+                candidate
+                for candidate in candidates
+                if self._candidate_level(entity, candidate) == "generalized"
+            ]
+            return bool(generalized)
         if entity.label not in {"DISEASE", "DRUG"}:
             return False
         registry = getattr(self, "resource_registry", None)
@@ -2180,10 +2542,12 @@ class MechanismFactory:
         candidate_generator: CandidateGenerator,
         density_scorer: DensityScorer,
         min_candidate_score: float = 0.25,
+        attack_strong: bool = False,
     ) -> None:
         self.candidate_generator = candidate_generator
         self.density_scorer = density_scorer
         self.min_candidate_score = min_candidate_score
+        self.attack_strong = attack_strong
 
     def perturb(self, entity: ExtractedEntity) -> PerturbationRecord:
         candidates = self.candidate_generator.generate(entity)
@@ -2195,7 +2559,7 @@ class MechanismFactory:
 
     def _perturb_categorical(self, entity: ExtractedEntity, candidates: list[str]) -> PerturbationRecord:
         scores = [self._utility_score(entity, candidate) for candidate in candidates]
-        if entity.label in {"DISEASE", "DRUG"}:
+        if entity.label in {"DISEASE", "DRUG", "DOSE", "SYMPTOM_PHRASE"}:
             risk = self.candidate_generator._entity_risk(entity)
             viable = [
                 candidate
@@ -2205,7 +2569,7 @@ class MechanismFactory:
             if viable:
                 candidates = viable
                 scores = [self._utility_score(entity, candidate) for candidate in candidates]
-            if getattr(self.candidate_generator, "resource_registry", None) is not None:
+            if entity.label in {"DISEASE", "DRUG"} and getattr(self.candidate_generator, "resource_registry", None) is not None:
                 generalized = [
                     candidate
                     for candidate in candidates
@@ -2236,7 +2600,10 @@ class MechanismFactory:
                     ]
                     if generalized:
                         protected = [*generalized]
-                        if entity.normalized_text not in protected:
+                        include_original = True
+                        if self.attack_strong and len(generalized) >= 3:
+                            include_original = False
+                        if include_original and entity.normalized_text not in protected:
                             protected.append(entity.normalized_text)
                         candidates = self.candidate_generator._dedupe_candidates(protected, entity.normalized_text)
                         boosted_scores = []
@@ -2244,9 +2611,19 @@ class MechanismFactory:
                             score = self._utility_score(entity, candidate)
                             level = self.candidate_generator._candidate_level(entity, candidate)
                             if candidate == entity.normalized_text:
-                                score -= 2.35 if entity.label == "DISEASE" else 1.60
+                                if entity.label == "DISEASE":
+                                    score -= 3.10 if self.attack_strong else 2.35
+                                elif entity.label == "DRUG":
+                                    score -= 2.30 if self.attack_strong else 1.60
+                                else:
+                                    score -= 1.90 if self.attack_strong else 1.10
                             elif level == "generalized":
-                                score += 0.95 if entity.label == "DISEASE" else 0.55
+                                if entity.label == "DISEASE":
+                                    score += 1.20 if self.attack_strong else 0.95
+                                elif entity.label == "DRUG":
+                                    score += 0.75 if self.attack_strong else 0.55
+                                else:
+                                    score += 0.80 if self.attack_strong else 0.45
                             boosted_scores.append(score)
                         scores = boosted_scores
         epsilon = entity.epsilon or 0.1
@@ -2274,7 +2651,13 @@ class MechanismFactory:
         )
 
     def _perturb_numeric(self, entity: ExtractedEntity, candidates: list[str]) -> PerturbationRecord:
+        if self.attack_strong and entity.label == "AGE":
+            alternatives = [candidate for candidate in candidates if candidate != entity.normalized_text]
+            if len(alternatives) >= 3:
+                candidates = self.candidate_generator._dedupe_candidates(alternatives, entity.normalized_text)
         scores = [self._numeric_utility(entity.normalized_text, candidate) for candidate in candidates]
+        if self.attack_strong and entity.label in {"AGE", "DATE"}:
+            scores = [score - 0.9 if candidate == entity.normalized_text else score + 0.15 for candidate, score in zip(candidates, scores)]
         epsilon = entity.epsilon or 0.1
         probs = self._exponential_probabilities(scores, epsilon=epsilon)
         sample = random.choices(candidates, weights=probs, k=1)[0]
@@ -2300,7 +2683,13 @@ class MechanismFactory:
         )
 
     def _perturb_structured(self, entity: ExtractedEntity, candidates: list[str]) -> PerturbationRecord:
+        if self.attack_strong and entity.label in {"EMAIL", "PHONE"}:
+            alternatives = [candidate for candidate in candidates if candidate != entity.normalized_text]
+            if alternatives:
+                candidates = self.candidate_generator._dedupe_candidates(alternatives, entity.normalized_text)
         scores = [self._structured_utility(entity.normalized_text, candidate, entity.label) for candidate in candidates]
+        if self.attack_strong and entity.label in {"EMAIL", "PHONE"}:
+            scores = [score - 1.2 if candidate == entity.normalized_text else score + 0.25 for candidate, score in zip(candidates, scores)]
         epsilon = entity.epsilon or 0.1
         probs = self._exponential_probabilities(scores, epsilon=epsilon)
         sample = random.choices(candidates, weights=probs, k=1)[0]
@@ -2366,14 +2755,20 @@ class MechanismFactory:
         except ValueError:
             return 0.0
         distance = abs(orig_value - cand_value)
-        return -distance
+        if distance == 0:
+            return -0.2
+        return -0.45 * distance
 
     def _structured_utility(self, original: str, candidate: str, label: str) -> float:
         score = SequenceMatcher(None, original.lower(), candidate.lower()).ratio()
         if label == "EMAIL":
-            score += 0.2 if original.split("@")[-1] == candidate.split("@")[-1] else 0.0
+            score += 0.25 if original.split("@")[-1] == candidate.split("@")[-1] else -0.1
+            if candidate != original:
+                score -= 0.25
         if label == "PHONE":
-            score += 0.2 if len(re.sub(r"\D", "", original)) == len(re.sub(r"\D", "", candidate)) else 0.0
+            score += 0.25 if len(re.sub(r"\D", "", original)) == len(re.sub(r"\D", "", candidate)) else -0.1
+            if candidate != original:
+                score -= 0.20
         return score
 
     def _semantic_similarity(self, original: str, candidate: str) -> float:
@@ -2454,16 +2849,20 @@ class DenPADSanitizer:
         medical_typer_config: Optional[str] = None,
         enable_medical_ner: bool = True,
         disable_age_date: bool = False,
+        disable_duration_phrase: bool = False,
         min_candidate_score: float = 0.25,
         candidate_llm_model: Optional[str] = "Qwen/Qwen2.5-3B-Instruct",
         candidate_llm_topk: int = 5,
+        attack_strong: bool = False,
         seed: int = 42,
     ) -> None:
         seed_everything(seed)
         self.epsilon_doc = epsilon_doc
         self.resource_registry = ResourceRegistry(resources_dir=resources_dir)
         self.disable_age_date = disable_age_date
+        self.disable_duration_phrase = disable_duration_phrase
         self.candidate_llm_model = candidate_llm_model
+        self.attack_strong = attack_strong
         self.medical_typer = MedicalTyper(
             resource_registry=self.resource_registry,
             model_name=medical_ner_backend,
@@ -2492,17 +2891,20 @@ class DenPADSanitizer:
             semantic_reranker=self.semantic_reranker,
             medical_typer=self.medical_typer,
             llm_completion=self.llm_completion,
+            attack_strong=attack_strong,
         )
         self.mechanism_factory = MechanismFactory(
             candidate_generator=self.candidate_generator,
             density_scorer=self.density_scorer,
             min_candidate_score=min_candidate_score,
+            attack_strong=attack_strong,
         )
 
     def sanitize_document(self, text: str, metadata: Optional[dict[str, Any]] = None) -> SanitizationResult:
         entities = self.extractor.extract(text)
+        extracted_counts = self._count_entities_by_label(entities)
         entities = self.density_scorer.score_entities(entities)
-        entities = self._filter_query_entities(entities)
+        entities, filter_stats = self._filter_query_entities(entities, with_stats=True)
         entities = self.budget_allocator.allocate(entities)
         perturbations = [self.mechanism_factory.perturb(entity) for entity in entities]
         sanitized_text = apply_perturbations_by_span(text, perturbations)
@@ -2511,7 +2913,12 @@ class DenPADSanitizer:
         result_metadata["num_perturbed"] = len(perturbations)
         result_metadata["epsilon_doc"] = self.epsilon_doc
         result_metadata["disable_age_date"] = self.disable_age_date
+        result_metadata["disable_duration_phrase"] = self.disable_duration_phrase
         result_metadata["candidate_llm_model"] = self.candidate_llm_model
+        result_metadata["attack_strong"] = self.attack_strong
+        result_metadata["extracted_entities_by_label"] = extracted_counts
+        result_metadata["filtered_out_entities_by_reason"] = filter_stats.get("filtered_out_entities_by_reason", {})
+        result_metadata["retained_entities_by_label"] = filter_stats.get("retained_entities_by_label", {})
         return SanitizationResult(
             original_text=text,
             sanitized_text=sanitized_text,
@@ -2579,8 +2986,9 @@ class DenPADSanitizer:
         for index, text in enumerate(docs):
             query_entities.extend(self.extractor.extract(text, doc_index=index))
 
+        extracted_counts = self._count_entities_by_label(query_entities)
         query_entities = self.density_scorer.score_entities(query_entities)
-        query_entities = self._filter_query_entities(query_entities)
+        query_entities, filter_stats = self._filter_query_entities(query_entities, with_stats=True)
         query_entities = self.budget_allocator.allocate_query(query_entities, epsilon_query=self.epsilon_doc)
 
         grouped_entities: dict[int, list[ExtractedEntity]] = {index: [] for index in range(len(docs))}
@@ -2630,11 +3038,22 @@ class DenPADSanitizer:
                 )
         level_counts: dict[str, int] = {}
         source_counts: dict[str, int] = {}
+        same_pick_by_label: dict[str, int] = {}
+        candidate_count_by_label: dict[str, dict[str, int]] = {}
+        selected_source_by_label: dict[str, dict[str, int]] = {}
         for record in audit_records:
             level = record.get("selected_level", "unknown")
             level_counts[level] = level_counts.get(level, 0) + 1
             source = record.get("selected_source", "unknown")
             source_counts[source] = source_counts.get(source, 0) + 1
+            label = record.get("label", "UNKNOWN")
+            if record.get("replacement") == record.get("entity"):
+                same_pick_by_label[label] = same_pick_by_label.get(label, 0) + 1
+            size_bucket = str(len(record.get("candidates", [])))
+            label_candidate_counts = candidate_count_by_label.setdefault(label, {})
+            label_candidate_counts[size_bucket] = label_candidate_counts.get(size_bucket, 0) + 1
+            label_source_counts = selected_source_by_label.setdefault(label, {})
+            label_source_counts[source] = label_source_counts.get(source, 0) + 1
         return sanitized_docs, {
             "query": query,
             "num_docs": len(docs),
@@ -2643,23 +3062,47 @@ class DenPADSanitizer:
             "epsilon_doc": self.epsilon_doc,
             "epsilon_query": self.epsilon_doc,
             "disable_age_date": self.disable_age_date,
+            "disable_duration_phrase": self.disable_duration_phrase,
+            "attack_strong": self.attack_strong,
+            "extracted_entities_by_label": extracted_counts,
+            "filtered_out_entities_by_reason": filter_stats.get("filtered_out_entities_by_reason", {}),
+            "retained_entities_by_label": filter_stats.get("retained_entities_by_label", {}),
             "selected_level_counts": level_counts,
             "selected_source_counts": source_counts,
+            "same_pick_by_label": same_pick_by_label,
+            "candidate_count_by_label": candidate_count_by_label,
+            "selected_source_by_label": selected_source_by_label,
             "resource_summary": self.resource_registry.get_resource_summary(),
             "resource_manifest": self.resource_registry.resource_manifest,
             "audit_records": audit_records,
         }
 
-    def _filter_query_entities(self, entities: list[ExtractedEntity]) -> list[ExtractedEntity]:
+    def _filter_query_entities(
+        self,
+        entities: list[ExtractedEntity],
+        with_stats: bool = False,
+    ) -> list[ExtractedEntity] | tuple[list[ExtractedEntity], dict[str, Any]]:
         filtered = []
+        filtered_reasons: dict[str, int] = {}
+        retained_counts: dict[str, int] = {}
         for entity in entities:
             if entity.density is None:
                 entity.density = self.density_scorer.score_entity(entity.normalized_text, entity.label)
-            if self.disable_age_date and entity.label in {"AGE", "DATE"}:
+            if self.disable_age_date and entity.label == "DATE":
                 entity.should_perturb = False
+                filtered_reasons["disabled_date"] = filtered_reasons.get("disabled_date", 0) + 1
+                continue
+            if self.disable_age_date and entity.label == "AGE" and not self.attack_strong:
+                entity.should_perturb = False
+                filtered_reasons["disabled_age"] = filtered_reasons.get("disabled_age", 0) + 1
+                continue
+            if self.disable_duration_phrase and entity.label == "DURATION_PHRASE":
+                entity.should_perturb = False
+                filtered_reasons["disabled_duration_phrase"] = filtered_reasons.get("disabled_duration_phrase", 0) + 1
                 continue
             if self.medical_typer.is_generic_sensitive(entity.label, entity.normalized_text.lower()):
                 entity.should_perturb = False
+                filtered_reasons[f"generic_{entity.label.lower()}"] = filtered_reasons.get(f"generic_{entity.label.lower()}", 0) + 1
                 continue
             if not self.medical_typer.is_high_risk(
                 entity.normalized_text,
@@ -2669,7 +3112,21 @@ class DenPADSanitizer:
                 evidence_source=entity.evidence_source,
             ):
                 entity.should_perturb = False
+                filtered_reasons[f"low_risk_{entity.label.lower()}"] = filtered_reasons.get(f"low_risk_{entity.label.lower()}", 0) + 1
                 continue
             entity.should_perturb = True
             filtered.append(entity)
-        return filtered
+            retained_counts[entity.label] = retained_counts.get(entity.label, 0) + 1
+        if not with_stats:
+            return filtered
+        return filtered, {
+            "filtered_out_entities_by_reason": filtered_reasons,
+            "retained_entities_by_label": retained_counts,
+        }
+
+    @staticmethod
+    def _count_entities_by_label(entities: list[ExtractedEntity]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entity in entities:
+            counts[entity.label] = counts.get(entity.label, 0) + 1
+        return counts

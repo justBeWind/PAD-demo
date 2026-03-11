@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import argparse
+import shutil
 import time
 import numpy as np
 from tqdm import tqdm
@@ -49,6 +50,53 @@ torch.set_num_threads(RUNTIME_THREADS)
 logging.basicConfig(level=logging.INFO)
 
 
+def sanitize_json_payload(value):
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return value
+    if isinstance(value, np.floating):
+        value = float(value)
+        return value if np.isfinite(value) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, dict):
+        return {key: sanitize_json_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_json_payload(item) for item in value]
+    return value
+
+
+def normalize_prompt_entries(raw_prompts):
+    prompt_entries = []
+    for idx, item in enumerate(raw_prompts):
+        if isinstance(item, str):
+            prompt_entries.append(
+                {
+                    "question": item,
+                    "ground_truth": "",
+                    "source_index": idx,
+                }
+            )
+            continue
+        if isinstance(item, dict):
+            question = item.get("question", item.get("prompt", item.get("input", "")))
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError(f"Prompt entry at index {idx} is missing a valid question field.")
+            prompt_entries.append(
+                {
+                    "question": question,
+                    "ground_truth": item.get("ground_truth", item.get("answer", item.get("output", ""))),
+                    "source_index": item.get("source_index", item.get("id", idx)),
+                }
+            )
+            continue
+        raise ValueError(f"Unsupported prompt entry type at index {idx}: {type(item).__name__}")
+    return prompt_entries
+
+
 def validate_method_args(args):
     method = args.method
 
@@ -61,9 +109,7 @@ def validate_method_args(args):
     elif method == "lprag":
         if args.density_map:
             raise ValueError("--density_map is only valid for the legacy decoder-side DenPAD implementation.")
-    elif method == "denpad":
-        if args.epsilon <= 0:
-            raise ValueError("--epsilon must be positive for method=denpad")
+    elif method == "denpad" or method == "contextpad":
         if args.density_map:
             raise ValueError("--density_map is not used by DenPAD-L. Remove it from the command.")
     else:
@@ -108,7 +154,7 @@ def resolve_db_name(dataset, method, args=None):
         if args is None:
             return f"{dataset}-corpus-lprag"
         return f"{dataset}-corpus-lprag-eps{format_config_value(args.lprag_epsilon)}{debug_suffix}"
-    return f"{dataset}-corpus"
+    return f"{dataset}-corpus{debug_suffix}"
 
 
 def resolve_db_paths(builder, args):
@@ -138,6 +184,14 @@ def construct_method_database(builder, documents, args):
     db_name = resolved["db_name"]
     persist_path = resolved["persist_path"]
     legacy_persist_path = resolved.get("legacy_persist_path")
+
+    if getattr(args, "force_rebuild_retrieval_db", False):
+        if os.path.exists(persist_path):
+            logging.info("Force rebuild requested. Removing retrieval DB at %s", persist_path)
+            shutil.rmtree(persist_path, ignore_errors=True)
+        if legacy_persist_path and os.path.exists(legacy_persist_path):
+            logging.info("Force rebuild requested. Removing legacy retrieval DB at %s", legacy_persist_path)
+            shutil.rmtree(legacy_persist_path, ignore_errors=True)
 
     if legacy_persist_path and os.path.exists(legacy_persist_path) and os.listdir(legacy_persist_path):
         logging.info("Legacy Chroma DB found at %s. Loading for backward compatibility...", legacy_persist_path)
@@ -232,7 +286,7 @@ def main():
     parser.add_argument(
         "--method",
         type=str,
-        choices=["baseline", "pad", "lprag", "denpad"],
+        choices=["baseline", "pad", "lprag", "denpad", "contextpad"],
         required=True,
         help="Mutually exclusive method choice for comparison experiments.",
     )
@@ -347,8 +401,26 @@ def main():
     parser.add_argument("--denpad_candidate_llm_topk", type=int, default=5, help="Maximum number of generalized candidates generated or reranked per entity.")
     parser.add_argument("--disable_denpad_medical_ner", action="store_true", help="Disable local medical type enhancement in retrieval-time DenPAD.")
     parser.add_argument("--denpad_disable_age_date", action="store_true", help="Disable AGE/DATE perturbation in DenPAD (recommended for Track A stability).")
+    parser.add_argument("--denpad_disable_duration_phrase", action="store_true", help="Disable DURATION_PHRASE perturbation in DenPAD. Recommended for the Track A main table unless duration spans are being ablated.")
+    parser.add_argument("--denpad_attack_strong", action="store_true", help="Enable stronger Track-A protection for DISEASE/DRUG and structured PII by further suppressing original-token selection.")
     parser.add_argument("--denpad_audit_file", type=str, default=None, help="Optional JSONL path for DenPAD-L perturbation audit records.")
+    parser.add_argument(
+        "--denpad_group_betas",
+        type=json.loads,
+        default=json.dumps(
+            {
+                "G_hide_strict": 0.03,
+                "G_preserve_soft": 0.12,
+                "G_structured": 0.02,
+                "G_numeric": 0.06,
+            }
+        ),
+        help="JSON dict controlling DenPAD-RF per-group divergence thresholds.",
+    )
+    parser.add_argument("--denpad_spacy_model", type=str, default="en_core_web_sm", help="spaCy model used for generic span extraction in DenPAD-RF.")
+    parser.add_argument("--denpad_mask_placeholder", type=str, default="_", help="Placeholder token wrapper used in DenPAD-RF context views.")
     parser.add_argument("--debug_corpus_limit", type=int, default=None, help="Optional limit on corpus documents/chunks for fast debugging.")
+    parser.add_argument("--force_rebuild_retrieval_db", action="store_true", help="Force rebuilding the retrieval DB instead of reusing an existing persisted index.")
     parser.add_argument("--debug_prompt_limit", type=int, default=None, help="Optional limit on evaluation prompts for fast debugging.")
     parser.add_argument("--retrieval_k", type=int, default=6, help="Number of retrieved chunks before reranking.")
     parser.add_argument("--rerank_top_n", type=int, default=3, help="Number of chunks kept after reranking or truncation.")
@@ -392,27 +464,20 @@ def main():
                 logging.info(f"Features: screening={not args.disable_screening}, calibration={not args.disable_calibration}")
                 logging.info(f"Enhancement: amplification={args.noise_amplification}, min_sensitivity={args.min_sensitivity}")
         elif args.method == "denpad":
-            logging.info("DenPAD-RT retrieval-time sanitization: epsilon_query=%s", args.epsilon)
+            logging.info("DenPAD-Latent retrieval-time latent perturbation is enabled.")
             logging.info(
-                "DenPAD-RT density backend=%s, k=%s, candidate_topk=%s",
-                args.denpad_density_backend,
-                args.denpad_density_k,
-                args.denpad_candidate_topk,
-            )
-            logging.info(
-                "DenPAD-RT resources dir=%s, medical_ner=%s, local_ner_backend=%s, typer_config=%s, disable_age_date=%s, candidate_min_score=%s",
-                args.denpad_resources_dir,
-                not args.disable_denpad_medical_ner,
-                args.denpad_local_ner_backend or "auto",
-                args.denpad_typer_config or "default(resources/medical_typer_config.json)",
+                "DenPAD-Latent span extractor=%s, disable_age_date=%s",
+                args.denpad_spacy_model,
                 args.denpad_disable_age_date,
-                args.denpad_candidate_min_score,
             )
+        elif args.method == "contextpad":
+            logging.info("ContextPAD ablation is enabled (single protected group, no query-aware grouping).")
             logging.info(
-                "DenPAD-RT local candidate completion model=%s, topk=%s",
-                args.denpad_candidate_llm_model or "disabled",
-                args.denpad_candidate_llm_topk,
+                "ContextPAD span extractor=%s, mask_placeholder=%s",
+                args.denpad_spacy_model,
+                args.denpad_mask_placeholder,
             )
+            logging.info("ContextPAD group beta=%s", args.denpad_group_betas.get("G_preserve_soft", 0.12))
         elif args.method == "lprag":
             logging.info(f"LPRAG entity perturbation: ε={args.lprag_epsilon}")
         else:
@@ -506,11 +571,12 @@ def main():
     if os.path.exists(prompt_file):
         logging.info(f"Loading test prompts from {prompt_file}")
         with open(prompt_file, "r", encoding="utf-8") as f:
-            prompts = json.load(f)
+            raw_prompts = json.load(f)
+        prompt_entries = normalize_prompt_entries(raw_prompts)
         if args.debug_prompt_limit is not None:
-            prompts = prompts[: args.debug_prompt_limit]
-            logging.info("Debug prompt limit enabled: using first %s prompts", len(prompts))
-        logging.info(f"Loaded {len(prompts)} test prompts from {prompt_file}")
+            prompt_entries = prompt_entries[: args.debug_prompt_limit]
+            logging.info("Debug prompt limit enabled: using first %s prompts", len(prompt_entries))
+        logging.info(f"Loaded {len(prompt_entries)} test prompts from {prompt_file}")
     else:
         logging.error(f"Prompt file {prompt_file} not found.")
         raise FileNotFoundError(f"Required prompt file {prompt_file} not found.")
@@ -607,29 +673,27 @@ def main():
         min_sensitivity=args.min_sensitivity,
         noise_type=args.noise_type,
         static_noise_scale=args.static_noise_scale,
-        verbose=args.verbose
+        verbose=args.verbose,
+        denpad_group_betas=args.denpad_group_betas,
     )
 
     # === Step 4: Initialize RAG Pipeline ===
     context_sanitizer = None
     if args.method == "denpad":
-        from denpad_core import DenPADSanitizer
+        from denpad_latent import DenPADLatentSanitizer
 
-        context_sanitizer = DenPADSanitizer(
-            epsilon_doc=args.epsilon,
-            density_backend=args.denpad_density_backend,
-            density_k=args.denpad_density_k,
-            candidate_topk=args.denpad_candidate_topk,
-            lambda_smooth=args.denpad_lambda_smooth,
-            min_epsilon=args.denpad_min_epsilon,
-            resources_dir=args.denpad_resources_dir,
-            medical_ner_backend=args.denpad_local_ner_backend,
-            medical_typer_config=args.denpad_typer_config,
-            enable_medical_ner=not args.disable_denpad_medical_ner,
+        context_sanitizer = DenPADLatentSanitizer(
+            spacy_model=args.denpad_spacy_model,
             disable_age_date=args.denpad_disable_age_date,
-            min_candidate_score=args.denpad_candidate_min_score,
-            candidate_llm_model=args.denpad_candidate_llm_model,
-            candidate_llm_topk=args.denpad_candidate_llm_topk,
+        )
+    elif args.method == "contextpad":
+        from denpad_rf import DenPADRFSanitizer
+
+        context_sanitizer = DenPADRFSanitizer(
+            spacy_model=args.denpad_spacy_model,
+            mask_placeholder=args.denpad_mask_placeholder,
+            disable_age_date=args.denpad_disable_age_date,
+            collapse_groups=args.method == "contextpad",
         )
 
     rag = RAGPipeline(
@@ -647,7 +711,7 @@ def main():
     else:
         output_file = os.path.join(out_dir, "rag_results.json")
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    if args.method == "denpad" and args.denpad_audit_file:
+    if args.method in {"denpad", "contextpad"} and args.denpad_audit_file:
         audit_dir = os.path.dirname(args.denpad_audit_file)
         if audit_dir:
             os.makedirs(audit_dir, exist_ok=True)
@@ -655,8 +719,10 @@ def main():
             f.write("")
 
     # Process each test prompt
-    for i, prompt in enumerate(tqdm(prompts, desc="Generating RAG responses")):
+    for i, prompt_entry in enumerate(tqdm(prompt_entries, desc="Generating RAG responses")):
         try:
+            prompt = prompt_entry["question"]
+            prompt_ground_truth = (prompt_entry.get("ground_truth") or "").strip()
             # === [MODIFICATION FOR REPRODUCIBILITY] ===
             # Ensure Enron prompts contain the attack command as described in "The Good and The Bad" paper.
             # The prompt file typically lacks this command, leading to low PPL and failed extraction attacks.
@@ -690,8 +756,8 @@ def main():
             result["gamma_dp"] = gamma_dp
 
             # === [Critical Fix] Inject Ground Truth with Robust Matching ===
-            ground_truth = ""
-            if args.dataset in ["healthcaremagic", "icliniq"]:
+            ground_truth = prompt_ground_truth
+            if not ground_truth and args.dataset in ["healthcaremagic", "icliniq"]:
                 clean_key = prompt.strip()
                 
                 # 策略 1: 直接精准匹配
@@ -743,15 +809,16 @@ def main():
             result["ground_truth"] = ground_truth
             # ==============================================================
 
-            if args.method == "denpad" and args.denpad_audit_file and result.get("denpad_audit"):
+            audit_records = result.get("denpad_audit_runtime") or result.get("denpad_audit")
+            if args.method in {"denpad", "contextpad"} and args.denpad_audit_file and audit_records:
                 with open(args.denpad_audit_file, "a", encoding="utf-8") as f:
-                    for record in result["denpad_audit"]:
+                    for record in audit_records:
                         record_with_query = {
                             "prompt_index": i,
                             "source_question": prompt,
                             **record,
                         }
-                        f.write(json.dumps(record_with_query, ensure_ascii=False) + "\n")
+                        f.write(json.dumps(sanitize_json_payload(record_with_query), ensure_ascii=False) + "\n")
 
         except Exception as e:
             # Handle errors gracefully
@@ -763,7 +830,7 @@ def main():
                 "ground_truth": "" # Error 时也要占位
             }
 
-        results.append(result)
+        results.append(sanitize_json_payload(result))
 
         # Display results for monitoring (only if verbose)
         if args.verbose:

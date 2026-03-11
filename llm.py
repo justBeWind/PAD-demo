@@ -11,6 +11,9 @@ import torch.nn.functional as F
 from sentence_transformers import CrossEncoder
 from transformers import LogitsProcessor
 
+from denpad_latent import LatentContextDecoder
+from denpad_rf import RiskFusionDecoder
+
 
 class PADRDPAccountant:
     """
@@ -436,6 +439,7 @@ class LLMEngine:
         static_noise_scale=0.1,
         dataset="healthcaremagic",
         verbose=False,
+        denpad_group_betas=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -443,9 +447,37 @@ class LLMEngine:
         self.epsilon = epsilon
         self.noise_type = noise_type
         self.verbose = verbose
+        self.fusion_decoder = None
+        self.latent_decoder = None
+        self.last_privacy_loss = None
+        self.last_gamma = None
+        self.last_latent_stats = None
 
-        if method == "baseline" or method == "lprag" or method == "denpad":
+        if self.tokenizer is not None and self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if method == "baseline" or method == "lprag":
             self.noise_processor = None
+        elif method == "denpad":
+            self.noise_processor = None
+            self.latent_decoder = LatentContextDecoder(
+                model=model,
+                tokenizer=tokenizer,
+                epsilon=epsilon,
+                alpha=alpha,
+                delta=delta,
+                verbose=verbose,
+            )
+        elif method == "contextpad":
+            self.noise_processor = None
+            self.fusion_decoder = RiskFusionDecoder(
+                model=model,
+                tokenizer=tokenizer,
+                alpha=alpha,
+                delta=delta,
+                group_betas=denpad_group_betas,
+                verbose=verbose,
+            )
         elif method == "pad":
             if noise_type == "static":
                 self.noise_processor = StaticNoiseProcessor(
@@ -470,6 +502,8 @@ class LLMEngine:
     def generate(self, prompt: str, **decoding_kwargs) -> str:
         if not self.model or not self.tokenizer:
             raise ValueError("Model/Tokenizer missing")
+        if self.method in {"denpad", "contextpad"}:
+            raise ValueError(f"method={self.method} requires generate_with_views(), not generate(prompt).")
 
         if self.noise_processor and hasattr(self.noise_processor, "reset"):
             self.noise_processor.reset()
@@ -519,14 +553,54 @@ class LLMEngine:
             print(f"[DP Log] Privacy Loss: {self.get_total_privacy_loss()}")
         return response
 
+    def generate_with_views(self, question: str, context_views: dict[str, list[str]], view_summaries: dict[str, dict], **decoding_kwargs) -> str:
+        if self.method != "contextpad" or self.fusion_decoder is None:
+            raise ValueError("generate_with_views() is only available for method=contextpad.")
+        answer, stats = self.fusion_decoder.generate(
+            question=question,
+            context_views=context_views,
+            group_summaries=view_summaries,
+            max_new_tokens=decoding_kwargs.get("max_new_tokens", 256),
+            temperature=decoding_kwargs.get("temperature", 0.2),
+            top_p=decoding_kwargs.get("top_p", 0.9),
+            do_sample=decoding_kwargs.get("do_sample", True),
+            repetition_penalty=decoding_kwargs.get("repetition_penalty", 1.0),
+        )
+        self.last_privacy_loss = stats.get("epsilon_global")
+        self.last_gamma = stats.get("avg_lambda")
+        self.last_fusion_stats = stats
+        return answer
+
+    def generate_with_latent(self, question: str, docs: list[str], sanitization_metadata: dict, **decoding_kwargs) -> str:
+        if self.method != "denpad" or self.latent_decoder is None:
+            raise ValueError("generate_with_latent() is only available for method=denpad.")
+        answer, stats = self.latent_decoder.generate(
+            question=question,
+            docs=docs,
+            sanitization_metadata=sanitization_metadata,
+            max_new_tokens=decoding_kwargs.get("max_new_tokens", 256),
+            temperature=decoding_kwargs.get("temperature", 0.2),
+            top_p=decoding_kwargs.get("top_p", 0.9),
+            do_sample=decoding_kwargs.get("do_sample", True),
+            repetition_penalty=decoding_kwargs.get("repetition_penalty", 1.0),
+        )
+        self.last_privacy_loss = stats.get("epsilon_global")
+        self.last_gamma = None
+        self.last_latent_stats = stats
+        return answer
+
     def get_total_privacy_loss(self):
         if self.noise_processor:
             return self.noise_processor.get_total_privacy_loss()
+        if self.method in {"denpad", "contextpad"}:
+            return self.last_privacy_loss
         return None
 
     def get_gamma(self):
         if self.noise_processor:
             return self.noise_processor.get_gamma()
+        if self.method in {"denpad", "contextpad"}:
+            return self.last_gamma
         return None
 
 
@@ -583,9 +657,24 @@ class RAGPipeline:
 
         context_original = "\n\n".join(original_docs)
         context = "\n\n".join(sanitized_docs)
-        prompt = f"[INST] Use the following context to answer the question.\n\nContext:\n{context}\n\nQuestion: {question} [/INST]"
         generation_start = time.perf_counter()
-        answer = self.llm.generate(prompt, **kwargs)
+        if sanitization_metadata is not None and sanitization_metadata.get("mode") == "latent" and hasattr(self.llm, "generate_with_latent"):
+            answer = self.llm.generate_with_latent(
+                question=question,
+                docs=original_docs,
+                sanitization_metadata=sanitization_metadata,
+                **kwargs,
+            )
+        elif sanitization_metadata is not None and "context_views" in sanitization_metadata and hasattr(self.llm, "generate_with_views"):
+            answer = self.llm.generate_with_views(
+                question=question,
+                context_views=sanitization_metadata["context_views"],
+                view_summaries=sanitization_metadata.get("view_summaries", {}),
+                **kwargs,
+            )
+        else:
+            prompt = f"[INST] Use the following context to answer the question.\n\nContext:\n{context}\n\nQuestion: {question} [/INST]"
+            answer = self.llm.generate(prompt, **kwargs)
         generation_time = time.perf_counter() - generation_start
 
         result = {
@@ -593,8 +682,9 @@ class RAGPipeline:
             "context": context,
             "context_original": context_original,
             "answer": answer,
-            "retrieved_docs": sanitized_docs,
+            "retrieved_docs": original_docs,
             "retrieved_docs_original": original_docs,
+            "retrieved_docs_defended": sanitized_docs,
             "retrieval_time_sec": retrieval_time,
             "rerank_time_sec": rerank_time,
             "sanitization_time_sec": sanitization_time,
@@ -605,9 +695,35 @@ class RAGPipeline:
             result["denpad_num_entities"] = sanitization_metadata.get("num_entities", 0)
             result["denpad_num_perturbed"] = sanitization_metadata.get("num_perturbed", 0)
             result["denpad_disable_age_date"] = sanitization_metadata.get("disable_age_date", False)
+            result["denpad_disable_duration_phrase"] = sanitization_metadata.get("disable_duration_phrase", False)
+            result["denpad_attack_strong"] = sanitization_metadata.get("attack_strong", False)
+            result["denpad_extracted_entities_by_label"] = sanitization_metadata.get("extracted_entities_by_label", {})
+            result["denpad_filtered_out_entities_by_reason"] = sanitization_metadata.get("filtered_out_entities_by_reason", {})
+            result["denpad_retained_entities_by_label"] = sanitization_metadata.get("retained_entities_by_label", {})
             result["denpad_selected_level_counts"] = sanitization_metadata.get("selected_level_counts", {})
             result["denpad_selected_source_counts"] = sanitization_metadata.get("selected_source_counts", {})
+            result["denpad_same_pick_by_label"] = sanitization_metadata.get("same_pick_by_label", {})
+            result["denpad_candidate_count_by_label"] = sanitization_metadata.get("candidate_count_by_label", {})
+            result["denpad_selected_source_by_label"] = sanitization_metadata.get("selected_source_by_label", {})
             result["denpad_resource_summary"] = sanitization_metadata.get("resource_summary", {})
             result["denpad_resource_manifest"] = sanitization_metadata.get("resource_manifest", {})
             result["denpad_audit"] = sanitization_metadata.get("audit_records", [])
+            if sanitization_metadata.get("mode") == "latent":
+                result["denpad_latent_metadata"] = {
+                    "retained_entities_by_label": sanitization_metadata.get("retained_entities_by_label", {}),
+                    "num_entities": sanitization_metadata.get("num_entities", 0),
+                    "num_perturbed": sanitization_metadata.get("num_perturbed", 0),
+                }
+                if getattr(self.llm, "latent_decoder", None) is not None:
+                    result["denpad_latent_stats"] = getattr(self.llm, "last_latent_stats", {})
+                    result["denpad_audit_runtime"] = result["denpad_latent_stats"].get("audit_records", [])
+            else:
+                result["denpad_context_views"] = {
+                    name: docs
+                    for name, docs in sanitization_metadata.get("context_views", {}).items()
+                    if name == "PUBLIC"
+                }
+                result["denpad_view_summaries"] = sanitization_metadata.get("view_summaries", {})
+            if getattr(self.llm, "fusion_decoder", None) is not None:
+                result["denpad_fusion_stats"] = getattr(self.llm, "last_fusion_stats", {})
         return result

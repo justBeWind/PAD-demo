@@ -161,6 +161,12 @@ class MedicalTyper:
             return True
         if label == "AGE":
             return True
+        if label == "DOSE":
+            return True
+        if label == "SYMPTOM_PHRASE":
+            return True
+        if label == "DURATION_PHRASE":
+            return True
         if label == "DATE":
             return bool(re.search(r"\b(19|20)\d{2}\b", lowered) or re.search(r"\b\d{1,2}[/-]\d{1,2}\b", lowered))
         if label in {"ORG", "GPE", "LOC"}:

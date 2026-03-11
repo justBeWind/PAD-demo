@@ -251,6 +251,14 @@ class CandidateLLMCompletion:
                 "Entity: euthyrox -> generalized: thyroid medication; hormone medication\n"
                 "Entity: trileptal -> generalized: seizure medication; neurological medication"
             )
+        elif entity_type == "SYMPTOM_PHRASE":
+            pattern = "... symptoms; ... discomfort; ... pain; ... issue"
+            examples = (
+                "Examples:\n"
+                "Entity: pain while urinating -> generalized: urinary discomfort; urinary symptoms\n"
+                "Entity: short term memory loss -> generalized: cognitive symptoms; memory-related symptoms\n"
+                "Entity: panic attacks -> generalized: mental health symptoms; emotional symptoms"
+            )
         else:
             pattern = "... condition"
             examples = "Examples:\nEntity: example -> generalized: medical condition"
@@ -289,6 +297,12 @@ class CandidateLLMCompletion:
                 "Good generalized drug replacements are broad phrases like "
                 "'pain medication', 'hormone medication', 'anti inflammatory treatment'.\n"
                 "Bad replacements are another specific drug, a brand/generic synonym, or an awkward phrase."
+            )
+        elif entity_type == "SYMPTOM_PHRASE":
+            rubric = (
+                "Good generalized symptom replacements are broad phrases like "
+                "'urinary discomfort', 'cognitive symptoms', 'mental health symptoms'.\n"
+                "Bad replacements are near copies of the original phrase, awkward wording, or another specific diagnosis."
             )
         else:
             rubric = "Approve only broad, safe generalized replacements."
