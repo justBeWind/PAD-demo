@@ -440,6 +440,7 @@ class LLMEngine:
         dataset="healthcaremagic",
         verbose=False,
         denpad_group_betas=None,
+        denpad_enable_midlayer_suppression=True,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -466,6 +467,7 @@ class LLMEngine:
                 epsilon=epsilon,
                 alpha=alpha,
                 delta=delta,
+                enable_midlayer_suppression=denpad_enable_midlayer_suppression,
                 verbose=verbose,
             )
         elif method == "contextpad":

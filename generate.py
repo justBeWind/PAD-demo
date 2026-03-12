@@ -419,6 +419,11 @@ def main():
     )
     parser.add_argument("--denpad_spacy_model", type=str, default="en_core_web_sm", help="spaCy model used for generic span extraction in DenPAD-RF.")
     parser.add_argument("--denpad_mask_placeholder", type=str, default="_", help="Placeholder token wrapper used in DenPAD-RF context views.")
+    parser.add_argument(
+        "--denpad_disable_midlayer_suppression",
+        action="store_true",
+        help="Disable the optional DenPAD-APU middle-layer suppression enhancement for ablation.",
+    )
     parser.add_argument("--debug_corpus_limit", type=int, default=None, help="Optional limit on corpus documents/chunks for fast debugging.")
     parser.add_argument("--force_rebuild_retrieval_db", action="store_true", help="Force rebuilding the retrieval DB instead of reusing an existing persisted index.")
     parser.add_argument("--debug_prompt_limit", type=int, default=None, help="Optional limit on evaluation prompts for fast debugging.")
@@ -675,6 +680,7 @@ def main():
         static_noise_scale=args.static_noise_scale,
         verbose=args.verbose,
         denpad_group_betas=args.denpad_group_betas,
+        denpad_enable_midlayer_suppression=not args.denpad_disable_midlayer_suppression,
     )
 
     # === Step 4: Initialize RAG Pipeline ===
@@ -685,6 +691,7 @@ def main():
         context_sanitizer = DenPADLatentSanitizer(
             spacy_model=args.denpad_spacy_model,
             disable_age_date=args.denpad_disable_age_date,
+            epsilon=args.epsilon,
         )
     elif args.method == "contextpad":
         from denpad_rf import DenPADRFSanitizer
