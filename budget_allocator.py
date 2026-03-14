@@ -61,13 +61,14 @@ class AdaptiveBudgetAllocator:
         self.epsilon = epsilon
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
+        self.delta = 1e-5
+        self.min_clip = 0.08
+        self.max_clip = 0.28
+        self.min_blend = 0.10
+        self.max_blend = 0.40
+        self.perturb_threshold = 0.18
+        self.allocation_smoothing = 0.05
         self.embedder = EmbeddingScorer(model_name=embedding_model_name)
-        self.prototype_names = list(PHI_TYPE_DEFINITIONS.keys())
-        self.prototype_embeddings = None
-        if self.embedder.enabled:
-            self.prototype_embeddings = self.embedder.encode(
-                [PHI_TYPE_DEFINITIONS[name].prototype_text for name in self.prototype_names]
-            )
 
     def allocate(self, query: str, docs: list[str], spans: list[SensitiveSpan], units: list[ProtectionUnit]) -> list[ProtectionUnit]:
         if not units:
@@ -107,6 +108,7 @@ class AdaptiveBudgetAllocator:
                 continue
             span.rarity_score = 1.0 - min(sum(token_counts.get(token, 0) for token in span_tokens) / (total_tokens * max(len(span_tokens), 1)), 1.0)
 
+        feature_rows: list[dict[str, float]] = []
         for unit in units:
             definition = phi_definition(unit.phi_type)
             unit_tokens = tokenize(unit.local_text)
@@ -121,53 +123,65 @@ class AdaptiveBudgetAllocator:
                 local_context_embeddings.get(id(unit)),
                 leave_out_embeddings.get(id(unit)),
             )
-            contextual_identifiability = self._context_identifiability(unit, definition, unit_embeddings.get(id(unit)))
+            linkage_risk = self._linkage_risk(unit)
             copyability = self._copyability(query, unit.local_text, semantic_rel)
-
-            risk = (
-                0.35 * definition.base_risk
-                + 0.22 * rarity
-                + 0.28 * contextual_identifiability
-                + 0.15 * copyability
+            risk = _clip(_safe_mean([definition.base_risk, rarity, linkage_risk, copyability]), 0.0, 1.0)
+            utility = _clip(_safe_mean([semantic_rel, retrieval_contribution]), 0.0, 1.0)
+            allocation_score = _clip(risk * (1.0 - utility), 0.0, 1.0)
+            feature_rows.append(
+                {
+                    "risk": risk,
+                    "utility": utility,
+                    "allocation_score": allocation_score,
+                    "copyability": copyability,
+                    "rarity": rarity,
+                    "linkage_risk": linkage_risk,
+                    "semantic_rel": semantic_rel,
+                    "retrieval_contribution": retrieval_contribution,
+                }
             )
-            utility = (
-                0.45 * semantic_rel
-                + 0.35 * retrieval_contribution
-                + 0.20 * definition.base_utility
-            )
-            risk = _clip(risk, 0.0, 1.0)
-            utility = _clip(utility, 0.0, 1.0)
 
-            unit.semantic_relevance = semantic_rel
-            unit.retrieval_contribution = retrieval_contribution
-            unit.identifiability_score = contextual_identifiability
+        allocation_denominator = sum(row["allocation_score"] + self.allocation_smoothing for row in feature_rows)
+        allocation_denominator = max(allocation_denominator, 1e-8)
+
+        for unit, row in zip(units, feature_rows):
+            risk = row["risk"]
+            utility = row["utility"]
+            allocation_score = row["allocation_score"]
+            copy_pressure = row["copyability"]
+
+            epsilon_share = (allocation_score + self.allocation_smoothing) / allocation_denominator
+            allocated_epsilon = self.epsilon * epsilon_share
+
+            unit.semantic_relevance = row["semantic_rel"]
+            unit.retrieval_contribution = row["retrieval_contribution"]
+            unit.identifiability_score = row["linkage_risk"]
             unit.risk_score = risk
             unit.utility_score = utility
-            unit.copy_risk = copyability
-            unit.rarity_score = rarity
+            unit.copy_risk = row["copyability"]
+            unit.rarity_score = row["rarity"]
+            unit.allocated_epsilon = allocated_epsilon
 
-            unit.sigma = self._sigma(unit, definition)
-            unit.clip_norm = self._clip_norm(unit, definition)
-            unit.blend = self._blend(unit, definition)
-            unit.midlayer_strength = self._midlayer_strength(unit, definition)
+            unit.sigma = self._sigma(allocated_epsilon)
+            unit.clip_norm = self._clip_norm(risk, utility)
+            unit.blend = self._blend(utility, copy_pressure)
+            unit.midlayer_strength = 0.0
 
             for span in unit.spans:
                 span.risk_score = max(span.risk_score, risk)
                 span.utility_score = utility
-                span.copy_risk = copyability
-                span.rarity_score = max(span.rarity_score, rarity)
+                span.copy_risk = row["copyability"]
+                span.rarity_score = max(span.rarity_score, row["rarity"])
                 span.sigma = unit.sigma
                 span.clip_norm = unit.clip_norm
+                span.allocated_epsilon = allocated_epsilon
 
         return units
 
     def should_perturb(self, unit: ProtectionUnit) -> bool:
-        definition = phi_definition(unit.phi_type)
-        if definition.group == "direct":
+        if phi_definition(unit.phi_type).group == "direct":
             return unit.risk_score >= 0.34
-        if definition.group == "narrative":
-            return unit.risk_score >= 0.48 and unit.utility_score <= 0.70
-        return unit.risk_score >= 0.54 and unit.utility_score <= 0.56
+        return (unit.risk_score * (1.0 - unit.utility_score)) >= self.perturb_threshold
 
     def _semantic_relevance(
         self,
@@ -204,31 +218,10 @@ class AdaptiveBudgetAllocator:
         leave_surface = SequenceMatcher(None, query.lower(), removed.lower()).ratio()
         return _clip(0.5 + (full_surface - leave_surface), 0.0, 1.0)
 
-    def _context_identifiability(self, unit: ProtectionUnit, definition, unit_embedding: Optional[np.ndarray]) -> float:
-        prototype_alignment = definition.base_risk
-        if unit_embedding is not None and self.prototype_embeddings is not None:
-            target_idx = self.prototype_names.index(unit.phi_type)
-            prototype_alignment = float(np.dot(unit_embedding, self.prototype_embeddings[target_idx]))
-            prototype_alignment = _clip(0.5 + 0.5 * prototype_alignment, 0.0, 1.0)
-
-        coherence = 0.0
-        if len(unit.spans) >= 2:
-            coherence += 0.08
-        if unit.context_flags.get("first_person"):
-            coherence += 0.06
-        if unit.context_flags.get("relationship"):
-            coherence += 0.06
-        if unit.context_flags.get("temporal"):
-            coherence += 0.05
-        if unit.context_flags.get("clinical"):
-            coherence += 0.05
-        if definition.group == "direct":
-            coherence += 0.10
-        elif definition.group == "narrative":
-            coherence += 0.08
-        elif unit.context_flags.get("measurement"):
-            coherence -= 0.08
-        return _clip(0.72 * prototype_alignment + 0.28 * _clip(coherence + definition.base_risk, 0.0, 1.0), 0.0, 1.0)
+    def _linkage_risk(self, unit: ProtectionUnit) -> float:
+        anchor_density = float(unit.context_scores.get("anchor_density", 0.0))
+        anchor_diversity = float(unit.context_scores.get("anchor_diversity", 0.0))
+        return _clip(_safe_mean([anchor_density, anchor_diversity]), 0.0, 1.0)
 
     def _copyability(self, query: str, unit_text: str, semantic_rel: float) -> float:
         query_tokens = set(tokenize(query))
@@ -237,39 +230,19 @@ class AdaptiveBudgetAllocator:
         surface = SequenceMatcher(None, query.lower(), unit_text.lower()).ratio()
         return _clip(_safe_mean([semantic_rel, overlap, surface]), 0.0, 1.0)
 
-    def _sigma(self, unit: ProtectionUnit, definition) -> float:
-        base_scale = min(1.0 / max(self.epsilon, 1e-3), 5.0)
-        privacy_pressure = 0.65 * unit.risk_score + 0.35 * unit.copy_risk
-        retention_pressure = unit.utility_score
-        raw = 0.004 + base_scale * (0.002 + 0.014 * privacy_pressure - 0.006 * retention_pressure)
-        if definition.group == "direct":
-            raw *= 1.20
-        elif definition.group == "narrative":
-            raw *= 1.15
-        elif definition.name == "MEASUREMENT":
-            raw *= 0.92
-        return _clip(raw, self.min_sigma, self.max_sigma)
+    def _sigma(self, allocated_epsilon: float) -> float:
+        effective_epsilon = max(allocated_epsilon, 1e-3)
+        gaussian_multiplier = np.sqrt(2.0 * np.log(1.25 / self.delta)) / effective_epsilon
+        normalized = gaussian_multiplier / (gaussian_multiplier + 50.0)
+        sigma = self.min_sigma + (self.max_sigma - self.min_sigma) * normalized
+        return _clip(sigma, self.min_sigma, self.max_sigma)
 
-    def _clip_norm(self, unit: ProtectionUnit, definition) -> float:
-        base = 0.10 + 0.19 * unit.risk_score - 0.05 * unit.utility_score + 0.06 * unit.copy_risk
-        if definition.group == "direct":
-            base += 0.06
-        elif definition.group == "narrative":
-            base += 0.05
-        return _clip(base, 0.06, 0.34)
+    def _clip_norm(self, risk: float, utility: float) -> float:
+        preservation = _safe_mean([risk, utility])
+        clip_norm = self.min_clip + (self.max_clip - self.min_clip) * preservation
+        return _clip(clip_norm, self.min_clip, self.max_clip)
 
-    def _blend(self, unit: ProtectionUnit, definition) -> float:
-        base = 0.10 + 0.30 * unit.risk_score - 0.16 * unit.utility_score + 0.12 * unit.copy_risk
-        if definition.group == "direct":
-            base += 0.08
-        elif definition.group == "narrative":
-            base += 0.06
-        return _clip(base, 0.08, 0.44)
-
-    def _midlayer_strength(self, unit: ProtectionUnit, definition) -> float:
-        base = 0.14 + 0.25 * unit.risk_score - 0.10 * unit.utility_score + 0.14 * unit.copy_risk
-        if definition.group == "direct":
-            base += 0.12
-        elif definition.group == "narrative":
-            base += 0.10
-        return _clip(base, 0.10, 0.62)
+    def _blend(self, utility: float, copy_pressure: float) -> float:
+        privacy_dominance = _safe_mean([1.0 - utility, copy_pressure])
+        blend = self.min_blend + (self.max_blend - self.min_blend) * privacy_dominance
+        return _clip(blend, self.min_blend, self.max_blend)

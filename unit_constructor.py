@@ -11,17 +11,7 @@ try:
 except ImportError:
     spacy = None
 
-from phi_taxonomy import (
-    CLINICAL_TERMS,
-    FIRST_PERSON_TERMS,
-    MEASUREMENT_TERMS,
-    PHITypeDefinition,
-    RELATIONSHIP_TERMS,
-    TEMPORAL_TERMS,
-    normalize_phi_type,
-    phi_definition,
-    PHI_TYPE_DEFINITIONS,
-)
+from phi_taxonomy import PHITypeDefinition, PHI_TYPE_DEFINITIONS, normalize_phi_type, phi_definition
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -81,6 +71,14 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
 
 
+def _clip(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _safe_mean(values: list[float]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
+
+
 @dataclass
 class SensitiveSpan:
     text: str
@@ -92,7 +90,7 @@ class SensitiveSpan:
     phi_type: str = "IDENTIFYING_NARRATIVE"
     phi_group: str = "narrative"
     local_context: str = ""
-    context_flags: dict[str, bool] = field(default_factory=dict)
+    context_scores: dict[str, float] = field(default_factory=dict)
     risk_score: float = 0.0
     utility_score: float = 0.0
     copy_risk: float = 0.0
@@ -102,6 +100,7 @@ class SensitiveSpan:
     clip_norm: float = 0.0
     sigma: float = 0.0
     perturb_norm: float = 0.0
+    allocated_epsilon: float = 0.0
 
 
 @dataclass
@@ -112,7 +111,7 @@ class ProtectionUnit:
     phi_type: str
     phi_group: str
     local_text: str
-    context_flags: dict[str, bool]
+    context_scores: dict[str, float]
     token_start: int = -1
     token_end: int = -1
     spans: list[SensitiveSpan] = field(default_factory=list)
@@ -123,6 +122,7 @@ class ProtectionUnit:
     clip_norm: float = 0.0
     sigma: float = 0.0
     perturb_norm: float = 0.0
+    allocated_epsilon: float = 0.0
     blend: float = 0.0
     midlayer_strength: float = 0.0
     semantic_relevance: float = 0.0
@@ -154,7 +154,6 @@ class ContextPrivacyExtractor:
         for span in merged:
             local_context = self.local_context(text, span.start_char, span.end_char)
             span.local_context = local_context
-            span.context_flags = context_flags(local_context)
             span.phi_type = normalize_phi_type(span.label, local_context, span.text)
             definition = phi_definition(span.phi_type)
             span.phi_group = definition.group
@@ -222,13 +221,9 @@ class ContextPrivacyExtractor:
             return True
         if lowered in LOWERCASE_ENTITY_STOPWORDS:
             return True
-        has_signal = (
-            any(term in lowered for term in RELATIONSHIP_TERMS)
-            or any(term in lowered for term in TEMPORAL_TERMS)
-            or any(term in lowered for term in CLINICAL_TERMS)
-            or any(ch.isdigit() for ch in normalized)
-        )
-        return not has_signal
+        if len(tokens) == 1 and not any(ch.isdigit() for ch in normalized):
+            return True
+        return False
 
     def _should_skip_spacy_entity(self, text: str, entity_text: str, label: str, start_char: int, end_char: int) -> bool:
         normalized = entity_text.strip()
@@ -317,18 +312,6 @@ class ContextPrivacyExtractor:
         return merged
 
 
-def context_flags(local_context: str) -> dict[str, bool]:
-    lowered = local_context.lower()
-    tokens = set(tokenize(lowered))
-    return {
-        "first_person": bool(tokens.intersection(FIRST_PERSON_TERMS)),
-        "relationship": bool(tokens.intersection(RELATIONSHIP_TERMS)),
-        "temporal": bool(tokens.intersection(TEMPORAL_TERMS)),
-        "clinical": bool(tokens.intersection(CLINICAL_TERMS)),
-        "measurement": any(term in lowered for term in MEASUREMENT_TERMS),
-    }
-
-
 class AdaptiveProtectionUnitConstructor:
     def __init__(
         self,
@@ -336,7 +319,7 @@ class AdaptiveProtectionUnitConstructor:
         embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     ) -> None:
         self.extractor = extractor
-        self.proposal_scorer = LearnedPHIProposalScorer(model_name=embedding_model_name)
+        self.proposal_scorer = TaxonomySemanticTyper(model_name=embedding_model_name)
 
     def propose_spans(self, docs: list[str]) -> list[SensitiveSpan]:
         spans: list[SensitiveSpan] = []
@@ -349,14 +332,15 @@ class AdaptiveProtectionUnitConstructor:
         for span in spans:
             doc_text = docs[span.doc_index]
             proposal_context = self.extractor.local_context(doc_text, span.start_char, span.end_char, window=96)
-            proposal_flags = context_flags(proposal_context)
+            anchor_stats = self._anchor_stats(span, spans)
+            span.context_scores = anchor_stats
             decision = self.proposal_scorer.score(
                 query=query,
                 base_phi_type=span.phi_type,
                 span_text=span.text,
                 local_text=proposal_context,
-                context_flags=proposal_flags,
                 evidence_source=span.evidence_source,
+                anchor_stats=anchor_stats,
             )
             if not decision["protect"]:
                 continue
@@ -370,7 +354,9 @@ class AdaptiveProtectionUnitConstructor:
                 promote_narrative=bool(decision["promote"]),
             )
             local_text = normalize_space(doc_text[start_char:end_char])
-            unit_flags = context_flags(local_text)
+            unit_scores = self._anchor_stats(span, spans, center_start=start_char, center_end=end_char)
+            unit_scores["protect_prob"] = float(decision["protect_prob"])
+            unit_scores["type_similarity"] = float(decision["type_similarity"])
             units.append(
                 ProtectionUnit(
                     doc_index=span.doc_index,
@@ -379,7 +365,7 @@ class AdaptiveProtectionUnitConstructor:
                     phi_type=phi_type,
                     phi_group=definition.group,
                     local_text=local_text,
-                    context_flags=unit_flags,
+                    context_scores=unit_scores,
                     spans=[span],
                 )
             )
@@ -395,11 +381,51 @@ class AdaptiveProtectionUnitConstructor:
             current.end_char = max(current.end_char, unit.end_char)
             current.local_text = normalize_space(docs[current.doc_index][current.start_char:current.end_char])
             current.spans.extend(unit.spans)
-            current.context_flags = {key: current.context_flags.get(key, False) or unit.context_flags.get(key, False) for key in set(current.context_flags) | set(unit.context_flags)}
+            current.context_scores = {
+                key: max(current.context_scores.get(key, 0.0), unit.context_scores.get(key, 0.0))
+                for key in set(current.context_scores) | set(unit.context_scores)
+            }
             if current.phi_type != "IDENTIFYING_NARRATIVE" and unit.phi_type == "IDENTIFYING_NARRATIVE":
                 current.phi_type = unit.phi_type
                 current.phi_group = unit.phi_group
         return merged
+
+    def _anchor_stats(
+        self,
+        span: SensitiveSpan,
+        spans: list[SensitiveSpan],
+        window: int = 96,
+        center_start: Optional[int] = None,
+        center_end: Optional[int] = None,
+    ) -> dict[str, float]:
+        left = span.start_char if center_start is None else center_start
+        right = span.end_char if center_end is None else center_end
+        nearby = []
+        for other in spans:
+            if other.doc_index != span.doc_index:
+                continue
+            if other is span:
+                continue
+            if other.end_char <= left - window or other.start_char >= right + window:
+                continue
+            nearby.append(other)
+
+        if not nearby:
+            return {
+                "anchor_density": 0.0,
+                "anchor_diversity": 0.0,
+                "numeric_anchor_ratio": 0.0,
+            }
+
+        density = min(len(nearby) / 4.0, 1.0)
+        diversity = min(len({item.phi_type for item in nearby}) / 3.0, 1.0)
+        numeric_count = sum(1 for item in nearby if phi_definition(item.phi_type).group == "quasi" and item.phi_type in {"AGE", "TEMPORAL_MARKER", "MEASUREMENT"})
+        numeric_ratio = numeric_count / max(len(nearby), 1)
+        return {
+            "anchor_density": float(density),
+            "anchor_diversity": float(diversity),
+            "numeric_anchor_ratio": float(_clip(numeric_ratio, 0.0, 1.0)),
+        }
 
     def _expand_span(
         self,
@@ -410,7 +436,7 @@ class AdaptiveProtectionUnitConstructor:
     ) -> tuple[int, int]:
         left_window = definition.left_window
         right_window = definition.right_window
-        if promote_narrative or definition.narrative or span.context_flags.get("clinical") or span.context_flags.get("temporal") or span.context_flags.get("relationship"):
+        if promote_narrative or definition.narrative:
             left_window = max(left_window, 56)
             right_window = max(right_window, 84)
 
@@ -434,20 +460,27 @@ class AdaptiveProtectionUnitConstructor:
                 break
         return start, end
 
-class LearnedPHIProposalScorer:
+class TaxonomySemanticTyper:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> None:
         self.model = None
-        self.prototype_names = list(PHI_TYPE_DEFINITIONS.keys())
-        self.prototype_embeddings = None
         self.coarse_names = ["direct", "quasi", "narrative", "ignore"]
         self.coarse_embeddings = None
+        self.quasi_names = [
+            "CANDIDATE_UNIT",
+            "PERSON_NAME",
+            "LOCATION",
+            "ORG_AFFILIATION",
+            "AGE",
+            "TEMPORAL_MARKER",
+            "RELATIONSHIP",
+            "MEASUREMENT",
+        ]
+        self.quasi_embeddings = None
         if SentenceTransformer is None:
-            LOGGER.warning("sentence-transformers unavailable; LearnedPHIProposalScorer falls back to base PHI labels.")
+            LOGGER.warning("sentence-transformers unavailable; TaxonomySemanticTyper falls back to base PHI labels.")
             return
         try:
             self.model = SentenceTransformer(model_name)
-            prototype_texts = [PHI_TYPE_DEFINITIONS[name].prototype_text for name in self.prototype_names]
-            self.prototype_embeddings = self.model.encode(prototype_texts, normalize_embeddings=True, show_progress_bar=False)
             coarse_texts = [
                 "direct personal identifier such as an email address, phone number, account id, or exact contact detail",
                 "quasi identifier such as age, location, organization, family relation, or time marker linked to a private person",
@@ -455,11 +488,16 @@ class LearnedPHIProposalScorer:
                 "non-sensitive or utility-dominant text that should not be protected as private information",
             ]
             self.coarse_embeddings = self.model.encode(coarse_texts, normalize_embeddings=True, show_progress_bar=False)
+            self.quasi_embeddings = self.model.encode(
+                [PHI_TYPE_DEFINITIONS[name].prototype_text for name in self.quasi_names],
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         except Exception as exc:
-            LOGGER.warning("Failed to initialize LearnedPHIProposalScorer with %s: %s", model_name, exc)
+            LOGGER.warning("Failed to initialize TaxonomySemanticTyper with %s: %s", model_name, exc)
             self.model = None
-            self.prototype_embeddings = None
             self.coarse_embeddings = None
+            self.quasi_embeddings = None
 
     def score(
         self,
@@ -467,8 +505,8 @@ class LearnedPHIProposalScorer:
         base_phi_type: str,
         span_text: str,
         local_text: str,
-        context_flags: dict[str, bool],
         evidence_source: str,
+        anchor_stats: dict[str, float],
     ) -> dict[str, Any]:
         base_definition = phi_definition(base_phi_type)
         if base_definition.group == "direct":
@@ -478,67 +516,91 @@ class LearnedPHIProposalScorer:
                 "protect_prob": 1.0,
                 "promotion_prob": 0.0,
                 "promote": False,
+                "type_similarity": 1.0,
             }
 
-        if self.model is None or self.prototype_embeddings is None or self.coarse_embeddings is None:
-            return self._fallback(base_phi_type, local_text, context_flags, evidence_source)
+        if self.model is None or self.coarse_embeddings is None or self.quasi_embeddings is None:
+            return self._fallback(base_phi_type, evidence_source, anchor_stats)
 
         text = (
             f"query: {query}\n"
             f"candidate: {span_text}\n"
             f"context: {local_text}\n"
             f"source: {evidence_source}\n"
-            f"base_type: {base_phi_type}"
+            f"base_type: {base_phi_type}\n"
+            f"anchor_density: {anchor_stats.get('anchor_density', 0.0):.2f}\n"
+            f"anchor_diversity: {anchor_stats.get('anchor_diversity', 0.0):.2f}\n"
+            f"numeric_anchor_ratio: {anchor_stats.get('numeric_anchor_ratio', 0.0):.2f}"
         )
         embedding = self.model.encode([text], normalize_embeddings=True, show_progress_bar=False)[0]
-        fine_scores = self.prototype_embeddings @ embedding
         coarse_scores = self.coarse_embeddings @ embedding
-        best_idx = int(fine_scores.argmax())
-        best_name = self.prototype_names[best_idx]
+        quasi_scores = self.quasi_embeddings @ embedding
+        best_quasi_idx = int(quasi_scores.argmax())
+        best_quasi = self.quasi_names[best_quasi_idx]
         best_coarse_idx = int(coarse_scores.argmax())
         best_coarse = self.coarse_names[best_coarse_idx]
-        narrative_score = float(fine_scores[self.prototype_names.index("IDENTIFYING_NARRATIVE")])
-        support = 0.06 * sum(int(v) for v in context_flags.values())
-        if evidence_source == "spacy":
-            support += 0.04
-        if evidence_source == "noun_chunk":
-            support += 0.02
 
-        protect_prob = 0.5 + 0.5 * max(float(coarse_scores[self.coarse_names.index("direct")]), float(coarse_scores[self.coarse_names.index("quasi")]), float(coarse_scores[self.coarse_names.index("narrative")]))
-        protect_prob = max(0.0, min(1.0, protect_prob + support))
-        promote = best_coarse == "narrative" or (narrative_score >= 0.18 and sum(int(v) for v in context_flags.values()) >= 2)
-        promotion_prob = max(0.0, min(1.0, 0.5 + 0.5 * narrative_score + support))
+        non_ignore_score = max(
+            float(coarse_scores[self.coarse_names.index("direct")]),
+            float(coarse_scores[self.coarse_names.index("quasi")]),
+            float(coarse_scores[self.coarse_names.index("narrative")]),
+        )
+        ignore_score = float(coarse_scores[self.coarse_names.index("ignore")])
+        protect_margin = non_ignore_score - ignore_score
+        protect_prob = 1.0 / (1.0 + pow(2.718281828, -4.0 * protect_margin))
 
-        phi_type = best_name
-        if promote and base_definition.group != "direct":
+        promote_signal = _safe_mean(
+            [
+                float(coarse_scores[self.coarse_names.index("narrative")]),
+                float(anchor_stats.get("anchor_density", 0.0)),
+                float(anchor_stats.get("anchor_diversity", 0.0)),
+            ]
+        )
+        promotion_prob = _clip(0.5 + 0.5 * promote_signal, 0.0, 1.0)
+        promote = (
+            base_definition.group != "direct"
+            and best_coarse == "narrative"
+            and anchor_stats.get("anchor_density", 0.0) >= 0.25
+            and anchor_stats.get("anchor_diversity", 0.0) >= 0.20
+            and promotion_prob >= 0.62
+        )
+
+        phi_type = base_phi_type if base_definition.group != "quasi" else best_quasi
+        if promote:
             phi_type = "IDENTIFYING_NARRATIVE"
-        elif best_coarse == "ignore" and protect_prob < 0.58:
+        elif best_coarse == "ignore" and protect_prob < 0.55:
             phi_type = base_phi_type
 
-        protect = protect_prob >= 0.58 or phi_definition(phi_type).group == "narrative"
+        protect = protect_prob >= 0.55 or phi_definition(phi_type).group == "narrative" or base_definition.group == "direct"
         return {
             "protect": protect,
             "phi_type": phi_type,
             "protect_prob": protect_prob,
             "promotion_prob": promotion_prob,
             "promote": promote,
+            "type_similarity": float(quasi_scores[best_quasi_idx]) if phi_type != "IDENTIFYING_NARRATIVE" else float(coarse_scores[self.coarse_names.index("narrative")]),
         }
 
     def _fallback(
         self,
         base_phi_type: str,
-        local_text: str,
-        context_flags: dict[str, bool],
         evidence_source: str,
+        anchor_stats: dict[str, float],
     ) -> dict[str, Any]:
-        narrative_hits = sum(int(v) for v in context_flags.values())
-        promote = phi_definition(base_phi_type).group != "direct" and narrative_hits >= 2
-        phi_type = "IDENTIFYING_NARRATIVE" if promote else base_phi_type
-        protect = evidence_source == "spacy" or phi_definition(phi_type).group != "quasi" or narrative_hits >= 1
+        phi_type = base_phi_type
+        protect = evidence_source in {"spacy", "regex"} or phi_definition(phi_type).group != "quasi" or anchor_stats.get("anchor_density", 0.0) >= 0.25
+        promote = (
+            phi_definition(base_phi_type).group == "quasi"
+            and anchor_stats.get("anchor_density", 0.0) >= 0.50
+            and anchor_stats.get("anchor_diversity", 0.0) >= 0.34
+        )
+        if promote:
+            phi_type = "IDENTIFYING_NARRATIVE"
         return {
             "protect": protect,
             "phi_type": phi_type,
             "protect_prob": 0.7 if protect else 0.3,
-            "promotion_prob": 0.8 if promote else 0.2,
+            "promotion_prob": 0.7 if promote else 0.2,
             "promote": promote,
+            "type_similarity": 0.5,
         }

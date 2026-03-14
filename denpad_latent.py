@@ -322,7 +322,7 @@ class LatentContextDecoder:
         min_sigma: float = 0.004,
         max_sigma: float = 0.04,
         max_input_length: int = 2048,
-        enable_midlayer_suppression: bool = True,
+        enable_midlayer_suppression: bool = False,
         enable_early_layer_dp: bool = True,
         early_layer_dp_fractions: tuple[float, ...] = (0.0, 0.12),
         early_layer_sigma_scale: float = 0.6,
